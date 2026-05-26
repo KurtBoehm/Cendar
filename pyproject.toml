@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Cendar"
+authors = [{ name = "Kurt Böhm", email = "kurbo96@gmail.com" }]
+description = "Scan documents, draw crop regions, export as JXL images."
+requires-python = ">=3.12"
+dynamic = ["version"]
+dependencies = ["numpy", "pillow", "PyGObject", "python-sane", "pyvips"]
+
+[project.scripts]
+Cendar = "cendar:run"
