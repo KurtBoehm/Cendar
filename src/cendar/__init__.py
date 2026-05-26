@@ -1994,7 +1994,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.tmp_idx += 1
         img.jxlsave(tmp_path, lossless=True)
 
-        pil_img = PILImage.fromarray(img.numpy)
+        pil_img = PILImage.fromarray(img.numpy())
 
         ccw = self.settings.defaults.default_rotation_ccw % 360
         if ccw != 0:
