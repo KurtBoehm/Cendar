@@ -431,24 +431,28 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
         content_header.set_title_widget(self.content_title)
 
-        self.btn_export = Gtk.Button()
         export_content = Adw.ButtonContent()
         export_content.set_icon_name("document-save-symbolic")
         export_content.set_label("Export")
-        self.btn_export.set_child(export_content)
-        self.btn_export.add_css_class("suggested-action")
+        self.btn_export = Gtk.Button(
+            child=export_content,
+            css_classes=["suggested-action"],
+        )
         self.btn_export.connect("clicked", lambda _b: self.export_changes())
         content_header.pack_end(self.btn_export)
 
         content_tv.add_top_bar(content_header)
 
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        main_box.set_margin_top(6)
-        main_box.set_margin_bottom(6)
-        main_box.set_margin_start(3)
-        main_box.set_margin_end(6)
-        main_box.set_hexpand(True)
-        main_box.set_vexpand(True)
+        main_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=6,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=3,
+            margin_end=6,
+            hexpand=True,
+            vexpand=True,
+        )
         content_tv.set_content(main_box)
 
         # Viewer above Regions, vertically resizable via Gtk.Paned
@@ -521,7 +525,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         return inner
 
     def _create_scrolled_list(
-        self,
+        self, *, separate: bool = False
     ) -> tuple[Gtk.ScrolledWindow, Gtk.ListBox]:
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -534,15 +538,16 @@ class ScannerWindow(Adw.ApplicationWindow):
         wrapper.set_vexpand(True)
         scrolled.set_child(wrapper)
 
-        lb = Gtk.ListBox()
-        lb.set_selection_mode(Gtk.SelectionMode.NONE)
-        lb.add_css_class("boxed-list")
-        lb.set_vexpand(False)
-        lb.set_valign(Gtk.Align.START)
-        lb.set_margin_top(6)
-        lb.set_margin_bottom(6)
-        lb.set_margin_start(6)
-        lb.set_margin_end(6)
+        lb = Gtk.ListBox(
+            selection_mode=Gtk.SelectionMode.NONE,
+            css_classes=["boxed-list-separate" if separate else "boxed-list"],
+            vexpand=False,
+            valign=Gtk.Align.START,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=6,
+            margin_end=6,
+        )
         wrapper.append(lb)
 
         return scrolled, lb
@@ -699,7 +704,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             parent, "Regions", hexpand=True, vexpand=True, pad_title=True
         )
 
-        scrolled, self.regions_list = self._create_scrolled_list()
+        scrolled, self.regions_list = self._create_scrolled_list(separate=True)
         reg_box.append(scrolled)
 
     # --- Top pane: page viewer ---
@@ -1431,10 +1436,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
             # Preset combo: "(Choose)" + real presets; "(Choose)" selected by default
             preset_model = Gtk.StringList.new(list(_REGION_CROP_PRESET_LABELS))
-            preset_row = Adw.ComboRow(
-                title="Preset",
-                model=preset_model,
-            )
+            preset_row = Adw.ComboRow(title="Preset", model=preset_model)
             preset_row.set_selected(0)
             row.add_row(preset_row)
 
@@ -1488,9 +1490,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             row.add_row(actions_row)
 
             # Separate Apply button row, visually emphasized
-            apply_row = Adw.ButtonRow(title="Apply coordinates")
-            apply_row.add_css_class("suggested-action")
-            apply_row.set_activatable(True)
+            apply_row = Adw.ButtonRow(title="Apply coordinates", activatable=True)
             apply_row.connect("activated", lambda _r, f=apply_coords: f())
             row.add_row(apply_row)
 
