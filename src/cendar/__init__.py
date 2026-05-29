@@ -2360,7 +2360,7 @@ def simple_prompt_async(
 
     dialog.connect("response", on_response)
     dialog.present(parent)
-    GLib.idle_add(entry.grab_focus)
+    GLib.idle_add(lambda: not entry.grab_focus())
 
 
 # --- libadwaita Application wrapper ---
