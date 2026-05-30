@@ -1,4 +1,10 @@
-# 📄 Cendar
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/KurtBoehm/Cendar/main/data/icons/org.kurbo96.Cendar.svg" width="128" height="128">
+
+# Cendar
+
+</div>
 
 Cendar (from Quenya _cenda-_ “to watch (intensively), observe (for some time); to read” and _-r_ “agental suffix”, per [Eldamo](https://eldamo.org/content/word-indexes/words-q.html)) is a GTK 4 + libadwaita app for Linux that lets you scan pages with SANE, mark rectangular regions, and batch-export them as lossless JPEG XL.
 
