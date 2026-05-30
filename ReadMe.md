@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://raw.githubusercontent.com/KurtBoehm/Cendar/main/data/icons/org.kurbo96.Cendar.svg" width="128" height="128">
+![Cendar Logo](https://raw.githubusercontent.com/KurtBoehm/Cendar/main/data/icons/org.kurbo96.Cendar.svg)
 
 # Cendar
 
