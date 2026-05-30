@@ -7,7 +7,7 @@ Cendar (from Quenya _cenda-_ “to watch (intensively), observe (for some time);
 - Discover and configure SANE-compatible scanners
 - Scan pages into logical groups (batches)
 - Rotate pages and manage per-page regions visually
-- Drag to create regions; edit coordinates numerically
+- Drag to create regions; edit coordinates numerically; rotate and preview regions
 - Copy/paste regions between pages
 - Batch‑export all regions to lossless JPEG XL files
 

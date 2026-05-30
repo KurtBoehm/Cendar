@@ -5,7 +5,6 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Callable, Literal, final, override
 
 import cairo
@@ -15,7 +14,7 @@ from pyvips import Image
 
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402  # pyright: ignore[reportMissingModuleSource]
 
 if TYPE_CHECKING:
     import sane
@@ -72,6 +71,7 @@ class Region:
     y1: int
     x2: int
     y2: int
+    rotation: int = 0  # degrees clockwise (0, 90, 180, 270)
 
 
 @dataclass
@@ -109,11 +109,6 @@ class ScannerWindow(Adw.ApplicationWindow):
         # Global settings model
         self.settings = AppSettings()
 
-        # Temp dir for JXLs
-        self.tmpdir_ctx = TemporaryDirectory()
-        self.tmpdir = Path(self.tmpdir_ctx.name)
-        self.tmp_idx = 0
-
         # SANE-related state
         self.scanner_dev: "sane.SaneDev | None" = None
         self.available_devices: list[tuple[str, str, str, str]] = []
@@ -144,6 +139,12 @@ class ScannerWindow(Adw.ApplicationWindow):
         # Offset of the image inside the DrawingArea (for centering)
         self._display_offset_x: float = 0.0
         self._display_offset_y: float = 0.0
+
+        # If not None, Page Viewer shows only this region's crop instead of full page
+        self._preview_region_id: str | None = None
+
+        # Map region.id -> its "eye" preview button (for highlighting)
+        self._region_preview_buttons: dict[str, Gtk.Button] = {}
 
         # Widgets
         self._viewer_paned_viewer_box: Gtk.Box
@@ -248,8 +249,25 @@ class ScannerWindow(Adw.ApplicationWindow):
                 return res
         return 0, 0, img_w, img_h
 
-    def _new_region(self, *, name: str, x1: int, y1: int, x2: int, y2: int) -> Region:
-        return Region(id=str(uuid.uuid4()), name=name, x1=x1, y1=y1, x2=x2, y2=y2)
+    def _new_region(
+        self,
+        *,
+        name: str,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        rotation: int = 0,
+    ) -> Region:
+        return Region(
+            id=str(uuid.uuid4()),
+            name=name,
+            x1=x1,
+            y1=y1,
+            x2=x2,
+            y2=y2,
+            rotation=rotation,
+        )
 
     # --- CSS ---
 
@@ -304,19 +322,21 @@ class ScannerWindow(Adw.ApplicationWindow):
             f"{name} ({vendor} {model})"
             for name, vendor, model, _ in self.available_devices
         ]
-        self._string_list_set(self.device_store, display)
-
-        prefix = "pixma:"
-        preferred_index: int | None = None
-        for idx, (name, _, _, _) in enumerate(self.available_devices):
-            if name.startswith(prefix):
-                preferred_index = idx
-                break
-        if preferred_index is None and self.available_devices:
-            preferred_index = 0
 
         self._suppress_scanner_row_signal = True
         try:
+            # Updating the model can change the selected row and emit notify::selected
+            self._string_list_set(self.device_store, display)
+
+            prefix = "pixma:"
+            preferred_index: int | None = None
+            for idx, (name, _, _, _) in enumerate(self.available_devices):
+                if name.startswith(prefix):
+                    preferred_index = idx
+                    break
+            if preferred_index is None and self.available_devices:
+                preferred_index = 0
+
             if preferred_index is not None:
                 self.selected_device_name = self.available_devices[preferred_index][0]
                 self.scanner_row.set_selected(preferred_index)
@@ -1310,11 +1330,13 @@ class ScannerWindow(Adw.ApplicationWindow):
     def refresh_regions_list(self) -> None:
         """Rebuild the Regions list for the selected page and sync viewer highlights."""
         self._clear_listbox(self.regions_list)
+        self._region_preview_buttons.clear()
 
         # Always keep the header in sync with current selection
         self._update_header_titles()
 
         if not self.selected_page:
+            self._preview_region_id = None
             self._add_placeholder_row(
                 self.regions_list,
                 "No page selected",
@@ -1326,6 +1348,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         page = self.selected_page
 
         if not page.regions:
+            self._preview_region_id = None
             self._add_placeholder_row(
                 self.regions_list,
                 "No regions yet",
@@ -1336,12 +1359,17 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         for i, reg in enumerate(page.regions):
             w, h = reg.x2 - reg.x1, reg.y2 - reg.y1
+            rot = reg.rotation % 360
 
-            row = Adw.ExpanderRow()
-            row.set_title(reg.name)
-            row.set_subtitle(f"{w}×{h} px")
-            row.set_activatable(False)
-            row.set_selectable(False)
+            subtitle = f"{w}×{h} px"
+            if rot:
+                subtitle += f", {rot}° CW"
+            row = Adw.ExpanderRow(
+                title=reg.name,
+                subtitle=subtitle,
+                activatable=False,
+                selectable=False,
+            )
             setattr(row, "_index", i)
             setattr(row, "_region_id", reg.id)
 
@@ -1358,19 +1386,58 @@ class ScannerWindow(Adw.ApplicationWindow):
 
             row.connect("notify::expanded", on_expanded_changed)
 
-            delete_btn = self._icon_only_button(
-                "user-trash-symbolic",
-                "Delete region",
+            suffixes: list[Gtk.Widget] = []
+
+            # Preview ("eye") button
+            preview_btn = self._icon_only_button(
+                "view-reveal-symbolic",
+                "Preview region",
             )
-            delete_btn.connect("clicked", lambda _b, idx=i: self.delete_region(idx))
-            row.add_suffix(delete_btn)
+
+            # Remember this button for highlighting
+            self._region_preview_buttons[reg.id] = preview_btn
+
+            preview_btn.connect("clicked", lambda _b, idx=i: self.preview_region(idx))
+            suffixes.append(preview_btn)
+
+            # Rotate region 90° CCW
+            btn_rot_ccw = self._icon_only_button(
+                "object-rotate-left-symbolic",
+                "Rotate region 90° counter-clockwise",
+            )
+            btn_rot_ccw.connect(
+                "clicked",
+                lambda _b, idx=i: self.rotate_region(idx, -90),
+            )
+            suffixes.append(btn_rot_ccw)
+
+            # Rotate region 90° CW
+            btn_rot_cw = self._icon_only_button(
+                "object-rotate-right-symbolic",
+                "Rotate region 90° clockwise",
+            )
+            btn_rot_cw.connect(
+                "clicked",
+                lambda _b, idx=i: self.rotate_region(idx, 90),
+            )
+            suffixes.append(btn_rot_cw)
 
             rename_btn = self._icon_only_button(
                 "document-edit-symbolic",
                 "Rename region",
             )
             rename_btn.connect("clicked", lambda _b, idx=i: self.rename_region(idx))
-            row.add_suffix(rename_btn)
+            suffixes.append(rename_btn)
+
+            delete_btn = self._icon_only_button(
+                "user-trash-symbolic",
+                "Delete region",
+            )
+            delete_btn.connect("clicked", lambda _b, idx=i: self.delete_region(idx))
+            suffixes.append(delete_btn)
+
+            for suffix in reversed(suffixes):
+                row.add_suffix(suffix)
 
             left_row = Adw.EntryRow(title="Left (x1)")
             left_row.set_text(str(reg.x1))
@@ -1431,7 +1498,11 @@ class ScannerWindow(Adw.ApplicationWindow):
                 finally:
                     self._suppress_region_coord_update = False
 
-                exp_row.set_subtitle(f"{w2}×{h2} px")
+                rot2 = reg2.rotation % 360
+                subtitle2 = f"{w2}×{h2} px"
+                if rot2:
+                    subtitle2 += f", {rot2}° CW"
+                exp_row.set_subtitle(subtitle2)
                 self.drawing_area.queue_draw()
 
             # Preset combo: "(Choose)" + real presets; "(Choose)" selected by default
@@ -1544,6 +1615,9 @@ class ScannerWindow(Adw.ApplicationWindow):
 
             self.regions_list.append(row)
 
+        # After all rows/buttons are created, sync eye highlights
+        self._refresh_preview_eye_highlight()
+
         self.drawing_area.queue_draw()
 
     # --- Copy/paste regions ---
@@ -1553,7 +1627,14 @@ class ScannerWindow(Adw.ApplicationWindow):
             self._info_dialog("Copy regions", "No page selected.")
             return
         self.copied_regions = [
-            self._new_region(name=reg.name, x1=reg.x1, y1=reg.y1, x2=reg.x2, y2=reg.y2)
+            self._new_region(
+                name=reg.name,
+                x1=reg.x1,
+                y1=reg.y1,
+                x2=reg.x2,
+                y2=reg.y2,
+                rotation=reg.rotation,
+            )
             for reg in self.selected_page.regions
         ]
         self._info_dialog(
@@ -1571,7 +1652,12 @@ class ScannerWindow(Adw.ApplicationWindow):
             return
         for reg in self.copied_regions:
             new_reg = self._new_region(
-                name=reg.name, x1=reg.x1, y1=reg.y1, x2=reg.x2, y2=reg.y2
+                name=reg.name,
+                x1=reg.x1,
+                y1=reg.y1,
+                x2=reg.x2,
+                y2=reg.y2,
+                rotation=reg.rotation,
             )
             self.selected_page.regions.append(new_reg)
         self.refresh_regions_list()
@@ -1615,6 +1701,8 @@ class ScannerWindow(Adw.ApplicationWindow):
             assert self.selected_page
             del self.selected_page.regions[idx]
             self.expanded_region_ids.discard(rid)
+            if self._preview_region_id == rid:
+                self._preview_region_id = None
             self.refresh_regions_list()
             self.refresh_groups_list()
 
@@ -1623,6 +1711,49 @@ class ScannerWindow(Adw.ApplicationWindow):
             "Delete this region?",
             callback=on_confirm,
         )
+
+    def rotate_region(self, idx: int, degrees_cw: int) -> None:
+        """Rotate a region independently of the page, in 90° steps."""
+        if not self.selected_page:
+            return
+        if not (0 <= idx < len(self.selected_page.regions)):
+            return
+
+        reg = self.selected_page.regions[idx]
+        reg.rotation = (reg.rotation + degrees_cw) % 360
+        self.refresh_regions_list()
+        self.drawing_area.queue_draw()
+
+    def _refresh_preview_eye_highlight(self) -> None:
+        """Highlight the eye button for the currently previewed region."""
+        for rid, btn in self._region_preview_buttons.items():
+            if self._preview_region_id == rid:
+                btn.remove_css_class("flat")
+            else:
+                btn.add_css_class("flat")
+
+    def preview_region(self, idx: int) -> None:
+        """Toggle preview of a region in the main Page Viewer."""
+        if not self.selected_page:
+            return
+        if not (0 <= idx < len(self.selected_page.regions)):
+            return
+
+        page = self.selected_page
+        reg = page.regions[idx]
+
+        # Toggle: clicking the same region again turns preview off.
+        if self._preview_region_id == reg.id:
+            self._preview_region_id = None
+        else:
+            self._preview_region_id = reg.id
+
+        # Update eye button highlighting based on the new preview id
+        self._refresh_preview_eye_highlight()
+
+        # IMPORTANT: do NOT touch expanded_region_ids here; we don't want
+        # previously previewed regions to become red in the page viewer.
+        self.drawing_area.queue_draw()
 
     # --- Group/page selection ---
 
@@ -1722,6 +1853,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             self.page_groups = [g for g in self.page_groups if g is not grp]
             self.selected_group = None
             self.selected_page = None
+            self._preview_region_id = None
             self.refresh_groups_list()
             self.refresh_regions_list()
 
@@ -1742,6 +1874,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             self.selected_group = None
             self.selected_page = None
             self.expanded_region_ids.clear()
+            self._preview_region_id = None
             self.refresh_groups_list()
             self.refresh_regions_list()
 
@@ -1774,6 +1907,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 self.selected_page = grp.pages[new_idx]
             else:
                 self.selected_page = None
+                self._preview_region_id = None
             self.refresh_groups_list()
             self.refresh_regions_list()
 
@@ -1980,7 +2114,6 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         try:
             np_arr = dev.arr_scan(progress=progress)
-            img = Image.new_from_array(np_arr)
         except Exception as e:
             if self._scan_cancel_event.is_set():
                 print(f"Scan cancelled: {e!r}")
@@ -1990,11 +2123,11 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         self._set_progress(1, 1, "Processing...")
 
-        tmp_path = self.tmpdir / f"tmp-{self.tmp_idx}.jxl"
-        self.tmp_idx += 1
-        img.jxlsave(tmp_path, lossless=True)
-
-        pil_img = PILImage.fromarray(img.numpy())
+        try:
+            pil_img = PILImage.fromarray(np_arr)
+        except Exception as e:
+            print(f"Failed to convert scanned data to image: {e!r}")
+            return None
 
         ccw = self.settings.defaults.default_rotation_ccw % 360
         if ccw != 0:
@@ -2065,15 +2198,41 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- DrawingArea (image + regions) ---
 
     def _ensure_pixbuf(self) -> None:
+        # Reset defaults
+        self._display_pixbuf = None
+        self._display_scale = 1.0
+        self._display_offset_x = 0.0
+        self._display_offset_y = 0.0
+
         if not self.selected_page:
-            self._display_pixbuf = None
-            self._display_scale = 1.0
-            self._display_offset_x = 0.0
-            self._display_offset_y = 0.0
             return
 
-        pil_img = self.selected_page.pil_image
+        page = self.selected_page
+        pil_img = page.pil_image
+
+        # If a region preview is active, crop and rotate that region
+        if self._preview_region_id is not None:
+            reg = next(
+                (r for r in page.regions if r.id == self._preview_region_id),
+                None,
+            )
+            if reg is None:
+                # Region disappeared (deleted, etc.) – fall back to full page
+                self._preview_region_id = None
+            else:
+                try:
+                    crop = pil_img.crop((reg.x1, reg.y1, reg.x2, reg.y2))
+                except Exception:
+                    self._preview_region_id = None
+                else:
+                    rot = reg.rotation % 360
+                    if rot:
+                        # PIL rotates CCW for positive angles; negate for CW
+                        crop = crop.rotate(-rot, expand=True)
+                    pil_img = crop
+
         w, h = pil_img.size
+
         alloc = self.drawing_area.get_allocation()
         cw, ch = max(1, alloc.width), max(1, alloc.height)
 
@@ -2100,6 +2259,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
         self._display_scale = scale
 
+        # Center in the DrawingArea
         self._display_offset_x = (cw - disp_w) / 2.0
         self._display_offset_y = (ch - disp_h) / 2.0
 
@@ -2122,6 +2282,10 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         Gdk.cairo_set_source_pixbuf(ctx, self._display_pixbuf, offset_x, offset_y)
         ctx.paint()
+
+        # In region-preview mode, draw just the region image, no overlays/drag-rect
+        if self._preview_region_id is not None:
+            return
 
         def img_to_canvas(px: int, py: int) -> tuple[float, float]:
             return (
@@ -2178,6 +2342,8 @@ class ScannerWindow(Adw.ApplicationWindow):
     ) -> None:
         if not self.selected_page:
             return
+        if self._preview_region_id is not None:
+            return  # no region creation while previewing
         if n_press == 1:
             self._drag_rect = (x, y, x, y)
             self.drawing_area.queue_draw()
@@ -2189,6 +2355,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         dy: float,
     ) -> None:
         if self._drag_rect is None:
+            return
+        if self._preview_region_id is not None:
             return
         start_x, start_y, _, _ = self._drag_rect
         cur_x = start_x + dx
@@ -2203,6 +2371,12 @@ class ScannerWindow(Adw.ApplicationWindow):
         _x: float,
         _y: float,
     ) -> None:
+        if self._preview_region_id is not None:
+            # Ignore clicks/releases in preview mode
+            self._drag_rect = None
+            self.drawing_area.queue_draw()
+            return
+
         if self._drag_rect is None or not self.selected_page:
             self._drag_rect = None
             self.drawing_area.queue_draw()
@@ -2286,6 +2460,12 @@ class ScannerWindow(Adw.ApplicationWindow):
         for idx, (gidx, pi, ri, page, reg) in enumerate(items, start=1):
             try:
                 crop = page.pil_image.crop((reg.x1, reg.y1, reg.x2, reg.y2))
+
+                rot = reg.rotation % 360
+                if rot:
+                    # PIL rotates counter‑clockwise for positive angles
+                    crop = crop.rotate(-rot, expand=True)
+
                 if crop.mode != "RGB":
                     crop = crop.convert("RGB")
                 arr = np.array(crop)
@@ -2319,7 +2499,6 @@ class ScannerWindow(Adw.ApplicationWindow):
             except Exception:
                 pass
         self._exit_sane()
-        self.tmpdir_ctx.cleanup()
         self.destroy()
 
 
