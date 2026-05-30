@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Cendar
+Comment=Scan, crop, and export pages
+Exec=Cendar %F
+Icon=org.kurbo96.Cendar
+Terminal=false
+Categories=Graphics;Scanning;
+StartupNotify=true
+StartupWMClass=org.kurbo96.Cendar

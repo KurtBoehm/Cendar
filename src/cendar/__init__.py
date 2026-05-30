@@ -1,3 +1,9 @@
+# This file is part of https://github.com/KurtBoehm/Cendar.
+#
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 from __future__ import annotations
 
 import threading
@@ -18,6 +24,8 @@ from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402  # p
 
 if TYPE_CHECKING:
     import sane
+
+__version__ = "1.0.0"
 
 CropPreset = Literal["full", "preset_1200_1700"]
 
@@ -102,7 +110,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app)
-        self.set_title("Scanner Page Manager")
+        self.set_title("Cendar")
         self.set_default_size(1400, 900)
         self.set_size_request(400, 600)
 
@@ -2547,7 +2555,7 @@ def simple_prompt_async(
 
 class ScannerApplication(Adw.Application):
     def __init__(self) -> None:
-        super().__init__(application_id="com.example.ScannerPageManager")
+        super().__init__(application_id="org.kurbo96.Cendar")
         self.window: ScannerWindow | None = None
 
     @override
