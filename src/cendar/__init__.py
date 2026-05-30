@@ -47,6 +47,7 @@ _CROP_LABEL_TO_PRESET: dict[str, CropPreset] = {
 _CROP_PRESET_LABELS: tuple[str, ...] = tuple(_CROP_LABEL_TO_PRESET.keys())
 _REGION_CROP_PRESET_LABELS: tuple[str, ...] = ("(Choose)",) + _CROP_PRESET_LABELS
 
+_REGION_BORDER_WIDTH = 4
 _SIDEBAR_DUMMY_SUBTITLE = ""
 
 # --- Data classes and configuration ---
@@ -2219,6 +2220,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         pil_img = page.pil_image
 
         # If a region preview is active, crop and rotate that region
+        reg: Region | None = None
         if self._preview_region_id is not None:
             reg = next(
                 (r for r in page.regions if r.id == self._preview_region_id),
@@ -2243,8 +2245,13 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         alloc = self.drawing_area.get_allocation()
         cw, ch = max(1, alloc.width), max(1, alloc.height)
+        if reg is None:
+            cwp = max(1, alloc.width - _REGION_BORDER_WIDTH)
+            chp = max(1, alloc.height - _REGION_BORDER_WIDTH)
+        else:
+            cwp, chp = cw, ch
 
-        scale = min(cw / w, ch / h)
+        scale = min(cwp / w, chp / h)
         if scale <= 0:
             scale = 1.0
 
@@ -2306,19 +2313,18 @@ class ScannerWindow(Adw.ApplicationWindow):
             x2, y2 = img_to_canvas(r.x2, r.y2)
             is_highlighted = r.id in self.expanded_region_ids
             if is_highlighted:
-                ctx.set_source_rgb(1.0, 0.27, 0.0)
-                line_w = 3.0
+                ctx.set_source_rgb(0.781, 0.094, 0.125)
             else:
-                ctx.set_source_rgb(0.12, 0.56, 1.0)
-                line_w = 2.0
-            ctx.set_line_width(line_w)
+                ctx.set_source_rgb(0.128, 0.320, 0.552)
+            ctx.set_line_width(_REGION_BORDER_WIDTH)
+            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
             ctx.rectangle(x1, y1, x2 - x1, y2 - y1)
             ctx.stroke()
 
         if self._drag_rect is not None:
             x1, y1, x2, y2 = self._drag_rect
-            ctx.set_source_rgb(1.0, 0.27, 0.0)
-            ctx.set_line_width(2.0)
+            ctx.set_source_rgb(0.781, 0.094, 0.125)
+            ctx.set_line_width(_REGION_BORDER_WIDTH)
             ctx.rectangle(x1, y1, x2 - x1, y2 - y1)
             ctx.stroke()
 
