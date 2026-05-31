@@ -10,5 +10,8 @@ requires-python = ">=3.12"
 dynamic = ["version"]
 dependencies = ["numpy", "pillow", "PyGObject", "python-sane", "pyvips"]
 
+[project.optional-dependencies]
+dev = ["PyGObject-stubs"]
+
 [project.scripts]
 Cendar = "cendar:run"

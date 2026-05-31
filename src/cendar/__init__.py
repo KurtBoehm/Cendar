@@ -20,7 +20,7 @@ from pyvips import Image
 
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402  # pyright: ignore[reportMissingModuleSource]
+from gi.repository import Adw, GObject, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402  # pyright: ignore[reportMissingModuleSource]
 
 if TYPE_CHECKING:
     import sane
@@ -175,7 +175,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.default_rot_combo: Adw.ComboRow
         self.default_crop_combo: Adw.ComboRow
 
-        self.folder_entry: Adw.EntryRow | None = None
+        self.folder_entry: Adw.EntryRow
 
         self.btn_new_group: Gtk.Button
         self.btn_clear_groups: Gtk.Button
@@ -770,7 +770,9 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     # --- Inline settings/combos ---
 
-    def on_scanner_row_changed(self, _row: Adw.ComboRow, _pspec: Gio.ParamSpec) -> None:
+    def on_scanner_row_changed(
+        self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec
+    ) -> None:
         if self._suppress_scanner_row_signal:
             return
 
@@ -789,7 +791,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.selected_device_name = new_name
         self._apply_scanner()
 
-    def on_dpi_changed(self, _row: Adw.ComboRow, _pspec: Gio.ParamSpec) -> None:
+    def on_dpi_changed(self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec) -> None:
         idx = self.dpi_combo.get_selected()
         if idx < 0 or idx >= self.dpi_store.get_n_items():
             return
@@ -812,7 +814,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             except Exception as e:
                 self._warning_dialog("Scanner", f"Failed to set resolution: {e}")
 
-    def on_mode_changed(self, _row: Adw.ComboRow, _pspec: Gio.ParamSpec) -> None:
+    def on_mode_changed(self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec) -> None:
         idx = self.mode_combo.get_selected()
         if idx < 0 or idx >= self.mode_store.get_n_items():
             return
@@ -829,7 +831,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def _on_viewer_paned_orientation_changed(
         self,
         paned: Gtk.Paned,
-        _pspec: Gio.ParamSpec,
+        _pspec: GObject.ParamSpec,
     ) -> None:
         viewer_box = self._viewer_paned_viewer_box
         regions_box = self._viewer_paned_regions_box
@@ -884,7 +886,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.default_rot_combo.set_selected(idx)
 
     def on_default_rotation_changed(
-        self, _row: Adw.ComboRow, _pspec: Gio.ParamSpec
+        self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec
     ) -> None:
         idx = self.default_rot_combo.get_selected()
         label = _ROTATION_LABELS[idx]
@@ -893,7 +895,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
     def on_default_crop_preset_changed(
-        self, _row: Adw.ComboRow, _pspec: Gio.ParamSpec
+        self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec
     ) -> None:
         idx = self.default_crop_combo.get_selected()
         label = _CROP_PRESET_LABELS[idx]
@@ -901,9 +903,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             label
         )
 
-    def on_folder_changed(self, _row: Adw.EntryRow, _pspec: Gio.ParamSpec) -> None:
-        if self.folder_entry is None:
-            return
+    def on_folder_changed(self, _row: Adw.EntryRow, _pspec: GObject.ParamSpec) -> None:
         self.settings.folder = Path(self.folder_entry.get_text().strip()).expanduser()
 
     def on_browse_folder(self, _button: Gtk.Button) -> None:
@@ -925,7 +925,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         except GLib.Error:
             return
         path = folder.get_path()
-        if path and self.folder_entry is not None:
+        if path:
             self.folder_entry.set_text(path)
 
     # --- Header titles ---
@@ -1385,7 +1385,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             row.set_expanded(reg.id in self.expanded_region_ids)
 
             def on_expanded_changed(
-                exp_row: Adw.ExpanderRow, _pspec: Gio.ParamSpec, rid: str = reg.id
+                exp_row: Adw.ExpanderRow, _pspec: GObject.ParamSpec, rid: str = reg.id
             ) -> None:
                 if exp_row.get_expanded():
                     self.expanded_region_ids.add(rid)
@@ -1522,7 +1522,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
             def on_preset_selected(
                 _combo: Adw.ComboRow,
-                _pspec: Gio.ParamSpec,
+                _pspec: GObject.ParamSpec,
                 idx: int = i,
                 left: Adw.EntryRow = left_row,
                 top: Adw.EntryRow = top_row,
