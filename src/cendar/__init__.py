@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 __version__ = "1.0.0"
 
+PILImage.MAX_IMAGE_PIXELS = 1 << 30
+
 CropPreset = Literal["full", "preset_1200_1700"]
 
 _ROTATION_LABEL_TO_CCW: dict[str, int] = {
