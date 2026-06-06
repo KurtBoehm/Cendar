@@ -13,14 +13,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, final, override
 
-import cairo
+import ctypes
+import numpy as np
 import gi
 from PIL import Image as PILImage
 from pyvips import Image
+from OpenGL import GL
 
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
-from gi.repository import Adw, GObject, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402  # pyright: ignore[reportMissingModuleSource]
+from gi.repository import Adw, GObject, Gdk, Gio, GLib, Gtk  # noqa: E402  # pyright: ignore[reportMissingModuleSource]
 
 if TYPE_CHECKING:
     import sane
@@ -143,7 +145,6 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._scan_cancel_event = threading.Event()
 
         # Drawing state
-        self._display_pixbuf: GdkPixbuf.Pixbuf | None = None
         self._display_scale: float = 1.0
         self._drag_rect: tuple[float, float, float, float] | None = None
 
@@ -185,7 +186,28 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.btn_refresh_scanners: Gtk.Button
         self.btn_browse_folder: Gtk.Button
 
-        self.drawing_area: Gtk.DrawingArea
+        self.drawing_area: Gtk.GLArea
+
+        # GL preview state (texture + key to know when to rebuild)
+        self._gl_tex_id: int | None = None
+        self._gl_tex_w: int = 0
+        self._gl_tex_h: int = 0
+        self._gl_tex_key: (
+            tuple[str, int, int, str]
+            | tuple[str, int, int, str, str, int, int, int, int, int]
+        ) | None = None
+        self._gl_preview_active: bool = False
+
+        # GL shader pipeline
+        self._gl_program: int = 0
+        self._gl_attr_pos: int = -1
+        self._gl_attr_texcoord: int = -1
+        self._gl_uniform_use_tex: int = -1
+        self._gl_uniform_color: int = -1
+        self._gl_uniform_sampler: int = -1
+        self._gl_vbo: int | None = None
+        self._gl_vao: int | None = None
+        self._gl_is_gles: bool = False
 
         # Guards
         self._suppress_group_expand_signal: bool = False
@@ -745,7 +767,8 @@ class ScannerWindow(Adw.ApplicationWindow):
             parent, "Page Viewer", hexpand=True, vexpand=True, pad_title=True
         )
 
-        self.drawing_area = Gtk.DrawingArea()
+        # Use GLArea instead of DrawingArea
+        self.drawing_area = Gtk.GLArea()
         self.drawing_area.add_css_class("card")
         self.drawing_area.set_hexpand(True)
         self.drawing_area.set_vexpand(True)
@@ -753,9 +776,17 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.drawing_area.set_margin_bottom(6)
         self.drawing_area.set_margin_start(6)
         self.drawing_area.set_margin_end(6)
-        self.drawing_area.set_draw_func(self.on_draw)
+
+        # Let GLArea render whenever GTK thinks it needs redraw
+        # self.drawing_area.set_auto_render(True)
+
+        # GL render and cleanup
+        self.drawing_area.connect("render", self.on_gl_render)
+        self.drawing_area.connect("unrealize", self.on_glarea_unrealize)
+
         viewer_box.append(self.drawing_area)
 
+        # Gestures work exactly the same; they attach to the GLArea widget
         gesture_click = Gtk.GestureClick.new()
         gesture_click.set_button(Gdk.BUTTON_PRIMARY)
         gesture_click.connect("pressed", self.on_da_press)
@@ -1353,7 +1384,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 "No page selected",
                 "Select a page to manage its regions.",
             )
-            self.drawing_area.queue_draw()
+            self.drawing_area.queue_render()
             return
 
         page = self.selected_page
@@ -1365,7 +1396,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 "No regions yet",
                 "Drag on the Page Viewer to create a new region.",
             )
-            self.drawing_area.queue_draw()
+            self.drawing_area.queue_render()
             return
 
         for i, reg in enumerate(page.regions):
@@ -1393,7 +1424,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                     self.expanded_region_ids.add(rid)
                 else:
                     self.expanded_region_ids.discard(rid)
-                self.drawing_area.queue_draw()
+                self.drawing_area.queue_render()
 
             row.connect("notify::expanded", on_expanded_changed)
 
@@ -1514,7 +1545,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 if rot2:
                     subtitle2 += f", {rot2}° CW"
                 exp_row.set_subtitle(subtitle2)
-                self.drawing_area.queue_draw()
+                self.drawing_area.queue_render()
 
             # Preset combo: "(Choose)" + real presets; "(Choose)" selected by default
             preset_model = Gtk.StringList.new(list(_REGION_CROP_PRESET_LABELS))
@@ -1629,7 +1660,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         # After all rows/buttons are created, sync eye highlights
         self._refresh_preview_eye_highlight()
 
-        self.drawing_area.queue_draw()
+        self.drawing_area.queue_render()
 
     # --- Copy/paste regions ---
 
@@ -1733,7 +1764,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         reg = self.selected_page.regions[idx]
         reg.rotation = (reg.rotation + degrees_cw) % 360
         self.refresh_regions_list()
-        self.drawing_area.queue_draw()
+        self.drawing_area.queue_render()
 
     def _refresh_preview_eye_highlight(self) -> None:
         """Highlight the eye button for the currently previewed region."""
@@ -1764,7 +1795,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         # IMPORTANT: do NOT touch expanded_region_ids here; we don't want
         # previously previewed regions to become red in the page viewer.
-        self.drawing_area.queue_draw()
+        self.drawing_area.queue_render()
 
     # --- Group/page selection ---
 
@@ -2208,34 +2239,36 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     # --- DrawingArea (image + regions) ---
 
-    def _ensure_pixbuf(self) -> None:
-        # Reset defaults
-        self._display_pixbuf = None
-        self._display_scale = 1.0
-        self._display_offset_x = 0.0
-        self._display_offset_y = 0.0
+    def _get_display_pil_image(
+        self,
+    ) -> tuple[PILImage.Image, Region | None]:
+        """
+        Return the PIL image that should currently be shown in the preview,
+        taking region preview and per-region rotation into account.
 
-        if not self.selected_page:
-            return
+        Returns (image, region) where region is None if showing full page.
+        """
+        assert self.selected_page is not None
 
         page = self.selected_page
         pil_img = page.pil_image
-
-        # If a region preview is active, crop and rotate that region
         reg: Region | None = None
+
         if self._preview_region_id is not None:
             reg = next(
                 (r for r in page.regions if r.id == self._preview_region_id),
                 None,
             )
             if reg is None:
-                # Region disappeared (deleted, etc.) – fall back to full page
+                # Region disappeared (deleted). Stop previewing.
                 self._preview_region_id = None
             else:
                 try:
                     crop = pil_img.crop((reg.x1, reg.y1, reg.x2, reg.y2))
                 except Exception:
+                    # Cropping failed – fall back to full page.
                     self._preview_region_id = None
+                    reg = None
                 else:
                     rot = reg.rotation % 360
                     if rot:
@@ -2243,92 +2276,514 @@ class ScannerWindow(Adw.ApplicationWindow):
                         crop = crop.rotate(-rot, expand=True)
                     pil_img = crop
 
-        w, h = pil_img.size
+        return pil_img, reg
 
-        alloc = self.drawing_area.get_allocation()
-        cw, ch = max(1, alloc.width), max(1, alloc.height)
-        if reg is None:
-            cwp = max(1, alloc.width - _REGION_BORDER_WIDTH)
-            chp = max(1, alloc.height - _REGION_BORDER_WIDTH)
-        else:
+    def _update_display_geometry(
+        self,
+        canvas_w: int,
+        canvas_h: int,
+        img_w: int,
+        img_h: int,
+        preview_active: bool,
+    ) -> None:
+        """Compute scale and centering offsets for the current image."""
+        cw = max(1, canvas_w)
+        ch = max(1, canvas_h)
+
+        if preview_active:
+            # In preview mode we let the image fill the full area
             cwp, chp = cw, ch
+        else:
+            # Leave a bit of room so the region border isn't clipped
+            cwp = max(1, cw - _REGION_BORDER_WIDTH)
+            chp = max(1, ch - _REGION_BORDER_WIDTH)
 
-        scale = min(cwp / w, chp / h)
+        scale = min(cwp / img_w, chp / img_h)
         if scale <= 0:
             scale = 1.0
 
-        disp_w, disp_h = int(w * scale), int(h * scale)
+        disp_w = img_w * scale
+        disp_h = img_h * scale
 
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
-        data = pil_img.tobytes()
-        pixbuf = GdkPixbuf.Pixbuf.new_from_data(
-            data,
-            GdkPixbuf.Colorspace.RGB,
-            False,
-            8,
-            w,
-            h,
-            w * 3,
-        )
-        self._display_pixbuf = pixbuf.scale_simple(
-            disp_w, disp_h, GdkPixbuf.InterpType.BILINEAR
-        )
         self._display_scale = scale
-
-        # Center in the DrawingArea
         self._display_offset_x = (cw - disp_w) / 2.0
         self._display_offset_y = (ch - disp_h) / 2.0
 
-    def on_draw(
-        self,
-        _area: Gtk.DrawingArea,
-        ctx: cairo.Context[cairo.Surface],
-        _w: int,
-        _h: int,
-    ) -> None:
+    def _get_glsl_sources(self, is_gles: bool) -> tuple[str, str]:
+        if is_gles:
+            vert = """
+                #version 100
+                precision mediump float;
+                attribute vec2 aPos;
+                attribute vec2 aTexCoord;
+                varying vec2 vTexCoord;
+                void main() {
+                    gl_Position = vec4(aPos, 0.0, 1.0);
+                    vTexCoord = aTexCoord;
+                }
+            """
+            frag = """
+                #version 100
+                precision mediump float;
+                varying vec2 vTexCoord;
+                uniform sampler2D uTexture;
+                uniform bool uUseTexture;
+                uniform vec4 uColor;
+                void main() {
+                    if (uUseTexture) {
+                        gl_FragColor = texture2D(uTexture, vTexCoord);
+                    } else {
+                        gl_FragColor = uColor;
+                    }
+                }
+            """
+        else:
+            vert = """
+                #version 150
+                in vec2 aPos;
+                in vec2 aTexCoord;
+                out vec2 vTexCoord;
+                void main() {
+                    gl_Position = vec4(aPos, 0.0, 1.0);
+                    vTexCoord = aTexCoord;
+                }
+            """
+            frag = """
+                #version 150
+                in vec2 vTexCoord;
+                out vec4 fragColor;
+                uniform sampler2D uTexture;
+                uniform bool uUseTexture;
+                uniform vec4 uColor;
+                void main() {
+                    if (uUseTexture) {
+                        fragColor = texture(uTexture, vTexCoord);
+                    } else {
+                        fragColor = uColor;
+                    }
+                }
+            """
+        return vert, frag
+
+    def _init_gl_resources(self, context: Gdk.GLContext) -> None:
+        if self._gl_program != 0:
+            return
+
+        # Decide whether this is GLES or desktop GL
+        self._gl_is_gles = bool(getattr(context, "get_use_es", lambda: False)())
+        vert_src, frag_src = self._get_glsl_sources(self._gl_is_gles)
+
+        def compile_shader(src: str, shader_type: int) -> int:
+            sid = GL.glCreateShader(shader_type)
+            GL.glShaderSource(sid, src)
+            GL.glCompileShader(sid)
+            status = GL.glGetShaderiv(sid, GL.GL_COMPILE_STATUS)
+            if not status:
+                log = GL.glGetShaderInfoLog(sid).decode("utf-8", "ignore")
+                raise RuntimeError(f"Shader compile failed: {log}")
+            return sid
+
+        vs = compile_shader(vert_src, GL.GL_VERTEX_SHADER)
+        fs = compile_shader(frag_src, GL.GL_FRAGMENT_SHADER)
+
+        prog = GL.glCreateProgram()
+        GL.glAttachShader(prog, vs)
+        GL.glAttachShader(prog, fs)
+        GL.glLinkProgram(prog)
+
+        link_status = GL.glGetProgramiv(prog, GL.GL_LINK_STATUS)
+        if not link_status:
+            log = GL.glGetProgramInfoLog(prog).decode("utf-8", "ignore")
+            raise RuntimeError(f"Program link failed: {log}")
+
+        # We can delete shaders once linked
+        GL.glDetachShader(prog, vs)
+        GL.glDetachShader(prog, fs)
+        GL.glDeleteShader(vs)
+        GL.glDeleteShader(fs)
+
+        self._gl_program = prog
+        self._gl_attr_pos = GL.glGetAttribLocation(prog, "aPos")
+        self._gl_attr_texcoord = GL.glGetAttribLocation(prog, "aTexCoord")
+        self._gl_uniform_use_tex = GL.glGetUniformLocation(prog, "uUseTexture")
+        self._gl_uniform_color = GL.glGetUniformLocation(prog, "uColor")
+        self._gl_uniform_sampler = GL.glGetUniformLocation(prog, "uTexture")
+
+        self._gl_vbo = GL.glGenBuffers(1)
+
+        # Core profiles require a VAO; GLES allows 0 but binding one is harmless.
+        self._gl_vao = None
+        if hasattr(GL, "glGenVertexArrays"):
+            self._gl_vao = GL.glGenVertexArrays(1)
+
+    def _ensure_gl_texture(self, canvas_w: int, canvas_h: int) -> bool:
+        """
+        Ensure we have a GL texture for the current page/preview.
+
+        Returns False if there is nothing to draw.
+        """
         if not self.selected_page:
-            return
+            return False
 
-        self._ensure_pixbuf()
-        if not self._display_pixbuf:
-            return
+        page = self.selected_page
 
-        offset_x = self._display_offset_x
-        offset_y = self._display_offset_y
+        pil_img, reg = self._get_display_pil_image()
+        img_w, img_h = pil_img.size
+        preview_active = reg is not None
 
-        Gdk.cairo_set_source_pixbuf(ctx, self._display_pixbuf, offset_x, offset_y)
-        ctx.paint()
-
-        # In region-preview mode, draw just the region image, no overlays/drag-rect
-        if self._preview_region_id is not None:
-            return
-
-        def img_to_canvas(px: int, py: int) -> tuple[float, float]:
-            return (
-                offset_x + px * self._display_scale,
-                offset_y + py * self._display_scale,
+        # Build a key that changes whenever the texture contents must change.
+        if reg is None:
+            key: (
+                tuple[str, int, int, str]
+                | tuple[str, int, int, str, str, int, int, int, int, int]
+            ) = (page.id, img_w, img_h, "full")
+        else:
+            key = (
+                page.id,
+                img_w,
+                img_h,
+                "reg",
+                reg.id,
+                reg.x1,
+                reg.y1,
+                reg.x2,
+                reg.y2,
+                reg.rotation % 360,
             )
 
-        for r in self.selected_page.regions:
-            x1, y1 = img_to_canvas(r.x1, r.y1)
-            x2, y2 = img_to_canvas(r.x2, r.y2)
-            is_highlighted = r.id in self.expanded_region_ids
-            if is_highlighted:
-                ctx.set_source_rgb(0.781, 0.094, 0.125)
-            else:
-                ctx.set_source_rgb(0.128, 0.320, 0.552)
-            ctx.set_line_width(_REGION_BORDER_WIDTH)
-            ctx.set_line_join(cairo.LINE_JOIN_ROUND)
-            ctx.rectangle(x1, y1, x2 - x1, y2 - y1)
-            ctx.stroke()
+        if key != self._gl_tex_key:
+            # Re-upload texture data
+            if pil_img.mode != "RGBA":
+                pil_img = pil_img.convert("RGBA")
+            data = pil_img.tobytes("raw", "RGBA")
 
+            # Delete old texture if any
+            if self._gl_tex_id:
+                GL.glDeleteTextures([self._gl_tex_id])
+                self._gl_tex_id = None
+
+            self._gl_tex_id = GL.glGenTextures(1)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._gl_tex_id)
+
+            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+            GL.glTexParameteri(
+                GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE
+            )
+            GL.glTexParameteri(
+                GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE
+            )
+
+            GL.glTexImage2D(
+                GL.GL_TEXTURE_2D,
+                0,
+                GL.GL_RGBA,
+                img_w,
+                img_h,
+                0,
+                GL.GL_RGBA,
+                GL.GL_UNSIGNED_BYTE,
+                data,
+            )
+
+            self._gl_tex_w = img_w
+            self._gl_tex_h = img_h
+            self._gl_tex_key = key
+
+        # Geometry / scale is recomputed each frame from current canvas size
+        self._gl_preview_active = preview_active
+        self._update_display_geometry(canvas_w, canvas_h, img_w, img_h, preview_active)
+
+        return self._gl_tex_id is not None
+
+    def on_gl_render(
+        self,
+        area: Gtk.GLArea,
+        context: Gdk.GLContext,
+    ) -> bool:
+        area.make_current()
+        err = area.get_error()
+        if err is not None:
+            print(f"GLArea error: {err.message}")
+            return False
+
+        # Lazy init of shaders / buffers once we have a context
+        if self._gl_program == 0:
+            try:
+                self._init_gl_resources(context)
+            except Exception as e:
+                print(f"Failed to init GL resources: {e}")
+                return False
+
+        width = area.get_allocated_width()
+        height = area.get_allocated_height()
+        if width <= 0 or height <= 0:
+            return True
+
+        GL.glViewport(0, 0, width, height)
+        GL.glDisable(GL.GL_DEPTH_TEST)
+        GL.glClearColor(0.0, 0.0, 0.0, 0.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+
+        if not self.selected_page:
+            return True
+
+        if not self._ensure_gl_texture(width, height):
+            return True
+
+        # Use our program and setup VAO/VBO
+        GL.glUseProgram(self._gl_program)
+        if self._gl_vao is not None:
+            GL.glBindVertexArray(self._gl_vao)
+        assert self._gl_vbo is not None
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._gl_vbo)
+
+        # Helper to convert canvas pixel coords to NDC [-1,1]
+        def canvas_to_ndc(x: float, y: float) -> tuple[float, float]:
+            nx = (2.0 * x / float(width)) - 1.0
+            ny = 1.0 - (2.0 * y / float(height))
+            return nx, ny
+
+        # --- Draw the page texture as a quad (two triangles) ---
+
+        img_w = self._gl_tex_w
+        img_h = self._gl_tex_h
+        scale = self._display_scale
+
+        disp_w = img_w * scale
+        disp_h = img_h * scale
+        x0 = self._display_offset_x
+        y0 = self._display_offset_y
+        x1 = x0 + disp_w
+        y1 = y0 + disp_h
+
+        x0n, y0n = canvas_to_ndc(x0, y0)
+        x1n, y1n = canvas_to_ndc(x1, y1)
+
+        # 6 vertices: two triangles; each vertex = (x, y, u, v)
+        vertices_quad = np.array(
+            [
+                # first triangle
+                x0n,
+                y0n,
+                0.0,
+                0.0,
+                x1n,
+                y0n,
+                1.0,
+                0.0,
+                x1n,
+                y1n,
+                1.0,
+                1.0,
+                # second triangle
+                x0n,
+                y0n,
+                0.0,
+                0.0,
+                x1n,
+                y1n,
+                1.0,
+                1.0,
+                x0n,
+                y1n,
+                0.0,
+                1.0,
+            ],
+            dtype=np.float32,
+        )
+
+        GL.glBufferData(
+            GL.GL_ARRAY_BUFFER,
+            vertices_quad.nbytes,
+            vertices_quad,
+            GL.GL_DYNAMIC_DRAW,
+        )
+
+        stride = 4 * 4  # 4 floats per vertex (x, y, u, v)
+        GL.glEnableVertexAttribArray(self._gl_attr_pos)
+        GL.glVertexAttribPointer(
+            self._gl_attr_pos,
+            2,
+            GL.GL_FLOAT,
+            GL.GL_FALSE,
+            stride,
+            ctypes.c_void_p(0),
+        )
+        GL.glEnableVertexAttribArray(self._gl_attr_texcoord)
+        GL.glVertexAttribPointer(
+            self._gl_attr_texcoord,
+            2,
+            GL.GL_FLOAT,
+            GL.GL_FALSE,
+            stride,
+            ctypes.c_void_p(2 * 4),
+        )
+
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._gl_tex_id)
+        GL.glUniform1i(self._gl_uniform_sampler, 0)
+        GL.glUniform1i(self._gl_uniform_use_tex, 1)
+        GL.glUniform4f(self._gl_uniform_color, 1.0, 1.0, 1.0, 1.0)
+
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
+
+        # --- Overlays (regions and drag rect) ---
+
+        # In preview mode we don't draw overlays
+        if self._gl_preview_active:
+            GL.glUseProgram(0)
+            if self._gl_vao is not None:
+                GL.glBindVertexArray(0)
+            return True
+
+        # Helper: image px -> canvas px
+        def img_to_canvas(px: int, py: int) -> tuple[float, float]:
+            return (
+                self._display_offset_x + px * self._display_scale,
+                self._display_offset_y + py * self._display_scale,
+            )
+
+        GL.glUniform1i(self._gl_uniform_use_tex, 0)
+        thickness = float(_REGION_BORDER_WIDTH)
+        half_t = thickness / 2.0
+
+        def add_quad(
+            buf: list[float], x1c: float, y1c: float, x2c: float, y2c: float
+        ) -> None:
+            """
+            Append two triangles (one filled quad) in NDC coords
+            for the axis-aligned rectangle [x1c,x2c]×[y1c,y2c] in canvas space.
+            """
+            qx1, qy1 = canvas_to_ndc(x1c, y1c)
+            qx2, qy2 = canvas_to_ndc(x2c, y2c)
+            # two triangles: (x1,y1)-(x2,y1)-(x2,y2) and (x1,y1)-(x2,y2)-(x1,y2)
+            buf.extend(
+                [
+                    qx1,
+                    qy1,
+                    0.0,
+                    0.0,
+                    qx2,
+                    qy1,
+                    0.0,
+                    0.0,
+                    qx2,
+                    qy2,
+                    0.0,
+                    0.0,
+                    qx1,
+                    qy1,
+                    0.0,
+                    0.0,
+                    qx2,
+                    qy2,
+                    0.0,
+                    0.0,
+                    qx1,
+                    qy2,
+                    0.0,
+                    0.0,
+                ]
+            )
+
+        def draw_rect_border_canvas(
+            x1c: float,
+            y1c: float,
+            x2c: float,
+            y2c: float,
+            color: tuple[float, float, float],
+        ) -> None:
+            """
+            Draw a rectangle border given in canvas coordinates as four filled quads.
+            Handles any drag direction by normalizing coordinates.
+            """
+            # normalize so left < right, top < bottom
+            if x2c < x1c:
+                x1c, x2c = x2c, x1c
+            if y2c < y1c:
+                y1c, y2c = y2c, y1c
+
+            GL.glUniform4f(self._gl_uniform_color, color[0], color[1], color[2], 1.0)
+
+            verts: list[float] = []
+
+            # top edge
+            add_quad(verts, x1c - half_t, y1c - half_t, x2c + half_t, y1c + half_t)
+            # bottom edge
+            add_quad(verts, x1c - half_t, y2c - half_t, x2c + half_t, y2c + half_t)
+            # left edge
+            add_quad(verts, x1c - half_t, y1c + half_t, x1c + half_t, y2c - half_t)
+            # right edge
+            add_quad(verts, x2c - half_t, y1c + half_t, x2c + half_t, y2c - half_t)
+
+            vertices = np.array(verts, dtype=np.float32)
+            GL.glBufferData(
+                GL.GL_ARRAY_BUFFER,
+                vertices.nbytes,
+                vertices,
+                GL.GL_DYNAMIC_DRAW,
+            )
+            GL.glVertexAttribPointer(
+                self._gl_attr_pos,
+                2,
+                GL.GL_FLOAT,
+                GL.GL_FALSE,
+                stride,
+                ctypes.c_void_p(0),
+            )
+            GL.glVertexAttribPointer(
+                self._gl_attr_texcoord,
+                2,
+                GL.GL_FLOAT,
+                GL.GL_FALSE,
+                stride,
+                ctypes.c_void_p(2 * 4),
+            )
+
+            # each vertex has 4 floats (x,y,u,v)
+            vertex_count = len(verts) // 4
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, vertex_count)
+
+        # Draw each region as a filled border
+        for r in self.selected_page.regions:
+            x1c, y1c = img_to_canvas(r.x1, r.y1)
+            x2c, y2c = img_to_canvas(r.x2, r.y2)
+
+            if r.id in self.expanded_region_ids:
+                col = (0.781, 0.094, 0.125)  # highlighted (red-ish)
+            else:
+                col = (0.128, 0.320, 0.552)  # normal (blue-ish)
+
+            draw_rect_border_canvas(x1c, y1c, x2c, y2c, col)
+
+        # Drag rectangle (if any), same border style
         if self._drag_rect is not None:
-            x1, y1, x2, y2 = self._drag_rect
-            ctx.set_source_rgb(0.781, 0.094, 0.125)
-            ctx.set_line_width(_REGION_BORDER_WIDTH)
-            ctx.rectangle(x1, y1, x2 - x1, y2 - y1)
-            ctx.stroke()
+            x1d, y1d, x2d, y2d = self._drag_rect
+            draw_rect_border_canvas(x1d, y1d, x2d, y2d, (0.781, 0.094, 0.125))
+
+    def on_glarea_unrealize(self, area: Gtk.GLArea) -> None:
+        area.make_current()
+        if area.get_error() is not None:
+            return
+
+        if self._gl_tex_id:
+            GL.glDeleteTextures([self._gl_tex_id])
+            self._gl_tex_id = None
+            self._gl_tex_key = None
+
+        if self._gl_vbo:
+            GL.glDeleteBuffers(1, [self._gl_vbo])
+            self._gl_vbo = None
+
+        if self._gl_vao:
+            GL.glDeleteVertexArrays(1, [self._gl_vao])
+            self._gl_vao = None
+
+        if self._gl_program:
+            GL.glDeleteProgram(self._gl_program)
+            self._gl_program = 0
 
     def _canvas_to_image_coords(self, x: float, y: float) -> tuple[int, int]:
         if not self.selected_page:
@@ -2362,7 +2817,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             return  # no region creation while previewing
         if n_press == 1:
             self._drag_rect = (x, y, x, y)
-            self.drawing_area.queue_draw()
+            self.drawing_area.queue_render()
 
     def on_da_drag(
         self,
@@ -2378,7 +2833,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         cur_x = start_x + dx
         cur_y = start_y + dy
         self._drag_rect = (start_x, start_y, cur_x, cur_y)
-        self.drawing_area.queue_draw()
+        self.drawing_area.queue_render()
 
     def on_da_release(
         self,
@@ -2390,16 +2845,16 @@ class ScannerWindow(Adw.ApplicationWindow):
         if self._preview_region_id is not None:
             # Ignore clicks/releases in preview mode
             self._drag_rect = None
-            self.drawing_area.queue_draw()
+            self.drawing_area.queue_render()
             return
 
         if self._drag_rect is None or not self.selected_page:
             self._drag_rect = None
-            self.drawing_area.queue_draw()
+            self.drawing_area.queue_render()
             return
         x1, y1, x2, y2 = self._drag_rect
         self._drag_rect = None
-        self.drawing_area.queue_draw()
+        self.drawing_area.queue_render()
 
         ix1, iy1 = self._canvas_to_image_coords(x1, y1)
         ix2, iy2 = self._canvas_to_image_coords(x2, y2)
@@ -2479,7 +2934,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
                 rot = reg.rotation % 360
                 if rot:
-                    # PIL rotates counter‑clockwise for positive angles
+                    # PIL rotates counter-clockwise for positive angles
                     crop = crop.rotate(-rot, expand=True)
 
                 if crop.mode != "RGB":
