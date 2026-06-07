@@ -32,6 +32,16 @@ __version__ = "1.0.0"
 PILImage.MAX_IMAGE_PIXELS = 1 << 30
 
 CropPreset = Literal["full", "preset_1200_1700"]
+RegionHandle = Literal[
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "top_left",
+    "top_right",
+    "bottom_left",
+    "bottom_right",
+]
 
 _ROTATION_LABEL_TO_CCW: dict[str, int] = {
     "0°": 0,
@@ -148,6 +158,9 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._display_scale: float = 1.0
         self._drag_rect: tuple[float, float, float, float] | None = None
 
+        # Current cursor shape for the viewer (None = default)
+        self._viewer_cursor_name: str | None = None
+
         # Offset of the image inside the DrawingArea (for centering)
         self._display_offset_x: float = 0.0
         self._display_offset_y: float = 0.0
@@ -157,6 +170,12 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         # Map region.id -> its “eye” preview button (for highlighting)
         self._region_preview_buttons: dict[str, Gtk.Button] = {}
+
+        # Active region-resize drag state
+        self._resize_region_id: str | None = None
+        self._resize_handle: RegionHandle | None = None
+        self._resize_start_x: float = 0.0
+        self._resize_start_y: float = 0.0
 
         # Widgets
         self._viewer_paned_viewer_box: Gtk.Box
@@ -818,6 +837,12 @@ class ScannerWindow(Adw.ApplicationWindow):
         gesture_drag = Gtk.GestureDrag.new()
         gesture_drag.connect("drag-update", self.on_da_drag)
         self.drawing_area.add_controller(gesture_drag)
+
+        # Pointer motion for hover feedback (resize cursors)
+        motion = Gtk.EventControllerMotion.new()
+        motion.connect("motion", self.on_da_motion)
+        motion.connect("leave", self.on_da_leave)
+        self.drawing_area.add_controller(motion)
 
     def _show_cancel_button(self, show: bool) -> None:
         """Show or hide the scan-cancel button."""
@@ -2780,9 +2805,11 @@ class ScannerWindow(Adw.ApplicationWindow):
             x1c, y1c = img_to_canvas(r.x1, r.y1)
             x2c, y2c = img_to_canvas(r.x2, r.y2)
             col = (
-                (0.781, 0.094, 0.125)
+                (0.2, 0.82, 0.478)
+                if r.id == self._resize_region_id
+                else (0.781, 0.094, 0.125)
                 if r.id in self.expanded_region_ids
-                else (0.128, 0.320, 0.552)
+                else (0.128, 0.32, 0.552)
             )
             draw_sdf_rounded_rect_canvas(x1c, y1c, x2c, y2c, col, border_px)
 
@@ -2817,6 +2844,15 @@ class ScannerWindow(Adw.ApplicationWindow):
             GL.glDeleteProgram(self._gl_program)
             self._gl_program = 0
 
+    def _img_to_canvas(self, px: int, py: int) -> tuple[float, float]:
+        """Convert image pixel coordinates to canvas coordinates."""
+        if self._display_scale <= 0:
+            return 0.0, 0.0
+        return (
+            self._display_offset_x + px * self._display_scale,
+            self._display_offset_y + py * self._display_scale,
+        )
+
     def _canvas_to_image_coords(self, x: float, y: float) -> tuple[int, int]:
         """Convert canvas coordinates to image pixel coordinates."""
         if not self.selected_page:
@@ -2835,6 +2871,157 @@ class ScannerWindow(Adw.ApplicationWindow):
         iy = max(0, min(iy, img_h - 1))
         return ix, iy
 
+    def _hit_test_region_edge(
+        self,
+        x: float,
+        y: float,
+    ) -> tuple[Region, RegionHandle] | None:
+        """
+        Return (region, handle) if (x, y) is near a region border.
+
+        Preference is given to the region whose eye was last clicked.
+        """
+        if not self.selected_page or not self.selected_page.regions:
+            return None
+        if self._display_scale <= 0:
+            return None
+
+        margin = 6.0  # px in canvas coordinates around borders/corners
+        candidates: list[tuple[Region, RegionHandle]] = []
+
+        # Hit-test in reverse order so later regions (visually on top) win by default
+        for reg in reversed(self.selected_page.regions):
+            x1c, y1c = self._img_to_canvas(reg.x1, reg.y1)
+            x2c, y2c = self._img_to_canvas(reg.x2, reg.y2)
+
+            # Quick reject if far outside the region + margin
+            if (
+                x < x1c - margin
+                or x > x2c + margin
+                or y < y1c - margin
+                or y > y2c + margin
+            ):
+                continue
+
+            on_left = abs(x - x1c) <= margin
+            on_right = abs(x - x2c) <= margin
+            on_top = abs(y - y1c) <= margin
+            on_bottom = abs(y - y2c) <= margin
+
+            handle: RegionHandle | None = None
+
+            # Corners first: drag in both dimensions
+            if on_left and on_top:
+                handle = "top_left"
+            elif on_right and on_top:
+                handle = "top_right"
+            elif on_left and on_bottom:
+                handle = "bottom_left"
+            elif on_right and on_bottom:
+                handle = "bottom_right"
+            # Edges next: drag in a single dimension
+            elif on_left:
+                handle = "left"
+            elif on_right:
+                handle = "right"
+            elif on_top:
+                handle = "top"
+            elif on_bottom:
+                handle = "bottom"
+
+            if handle is not None:
+                candidates.append((reg, handle))
+
+        if not candidates:
+            return None
+
+        return candidates[0]
+
+    def _set_viewer_cursor(self, cursor_name: str | None) -> None:
+        """Set the mouse cursor for the page viewer, if it has changed."""
+        if cursor_name == self._viewer_cursor_name:
+            return
+        self._viewer_cursor_name = cursor_name
+        self.drawing_area.set_cursor(
+            Gdk.Cursor.new_from_name(cursor_name) if cursor_name is not None else None
+        )
+
+    @staticmethod
+    def _cursor_name_for_handle(handle: RegionHandle) -> str:
+        """Map a resize handle name to a standard cursor name."""
+        if handle in ("left", "right"):
+            return "ew-resize"
+        if handle in ("top", "bottom"):
+            return "ns-resize"
+        if handle in ("top_left", "bottom_right"):
+            return "nwse-resize"
+        if handle in ("top_right", "bottom_left"):
+            return "nesw-resize"
+
+    def _begin_region_resize(self, x: float, y: float) -> bool:
+        """
+        If (x, y) is near a region border, start a resize operation.
+
+        Returns True if a resize was started, False otherwise.
+        """
+        if not self.selected_page:
+            return False
+        # Do not allow resizing while page is in cropped preview mode
+        if self._preview_region_id is not None:
+            return False
+
+        hit = self._hit_test_region_edge(x, y)
+        if hit is None:
+            return False
+
+        reg, edge = hit
+        self._resize_region_id = reg.id
+        self._resize_handle = edge
+        self._resize_start_x = x
+        self._resize_start_y = y
+
+        # Update cursor to reflect the active resize handle
+        cursor_name = self._cursor_name_for_handle(edge)
+        self._set_viewer_cursor(cursor_name)
+
+        self.drawing_area.queue_render()
+        return True
+
+    def _apply_region_resize(self, canvas_x: float, canvas_y: float) -> None:
+        """Update the active region's rectangle based on the current drag position."""
+        if not self.selected_page:
+            return
+        if not self._resize_region_id or not self._resize_handle:
+            return
+
+        page = self.selected_page
+        reg = next((r for r in page.regions if r.id == self._resize_region_id), None)
+        if reg is None:
+            return
+
+        ix, iy = self._canvas_to_image_coords(canvas_x, canvas_y)
+        img_w, img_h = page.pil_image.size
+
+        x1, y1, x2, y2 = reg.x1, reg.y1, reg.x2, reg.y2
+        handle = self._resize_handle
+
+        # Horizontal adjustment
+        if "left" in handle:
+            x1 = ix
+        elif "right" in handle:
+            x2 = ix
+
+        # Vertical adjustment
+        if "top" in handle:
+            y1 = iy
+        elif "bottom" in handle:
+            y2 = iy
+
+        res = self._normalize_and_clamp_region(x1, y1, x2, y2, img_w, img_h)
+        if res is None:
+            return
+        reg.x1, reg.y1, reg.x2, reg.y2 = res
+
     # Gesture/drag handlers
 
     def on_da_press(
@@ -2844,17 +3031,33 @@ class ScannerWindow(Adw.ApplicationWindow):
         x: float,
         y: float,
     ) -> None:
-        """Start a region drag rectangle on mouse press in the viewer."""
+        """Start a region resize (if near a border) or a new-region drag rectangle."""
         if not self.selected_page:
             return
+
+        # First try to start resizing an existing region
+        if self._begin_region_resize(x, y):
+            return
+
+        # Do not create new regions while a preview crop is active
         if self._preview_region_id is not None:
             return
+
         if n_press == 1:
             self._drag_rect = (x, y, x, y)
             self.drawing_area.queue_render()
 
     def on_da_drag(self, _gesture: Gtk.GestureDrag, dx: float, dy: float) -> None:
-        """Update the region drag rectangle while the mouse is dragged."""
+        """Update either an active region resize or the new-region drag rectangle."""
+        # Active region-resize takes priority
+        if self._resize_region_id is not None:
+            cur_x = self._resize_start_x + dx
+            cur_y = self._resize_start_y + dy
+            self._apply_region_resize(cur_x, cur_y)
+            self.drawing_area.queue_render()
+            return
+
+        # Fallback: new-region creation drag
         if self._drag_rect is None:
             return
         if self._preview_region_id is not None:
@@ -2871,8 +3074,19 @@ class ScannerWindow(Adw.ApplicationWindow):
         _x: float,
         _y: float,
     ) -> None:
-        """Finish region creation from a drag rectangle on mouse release."""
+        """Finish a region resize or create a new region from the drag rectangle."""
+        # Finish an active resize, if any
+        if self._resize_region_id is not None:
+            self._resize_region_id = None
+            self._resize_handle = None
+            # Sync the coordinate editor UI with the new region rectangle
+            self.refresh_regions_list()
+            self.refresh_groups_list()
+            self.drawing_area.queue_render()
+            return
+
         if self._preview_region_id is not None:
+            # Ignore clicks/releases in preview mode
             self._drag_rect = None
             self.drawing_area.queue_render()
             return
@@ -2900,10 +3114,46 @@ class ScannerWindow(Adw.ApplicationWindow):
         reg = self._new_region(name=name, x1=ix1, y1=iy1, x2=ix2, y2=iy2)
         self.selected_page.regions.append(reg)
 
+        # New region starts expanded (and therefore highlighted)
         self.expanded_region_ids.add(reg.id)
 
         self.refresh_regions_list()
         self.refresh_groups_list()
+
+    def on_da_motion(
+        self,
+        _controller: Gtk.EventControllerMotion,
+        x: float,
+        y: float,
+    ) -> None:
+        """
+        Update the viewer cursor when hovering near region borders/corners.
+
+        Shows resize cursors near draggable borders; default cursor elsewhere.
+        """
+        # No page or in preview mode: no region resizing, default cursor
+        if not self.selected_page or self._preview_region_id is not None:
+            self._set_viewer_cursor(None)
+            return
+
+        handle: RegionHandle | None = None
+
+        # While actively resizing, keep the resize cursor consistent
+        if self._resize_region_id is not None and self._resize_handle is not None:
+            handle = self._resize_handle
+        else:
+            hit = self._hit_test_region_edge(x, y)
+            if hit is not None:
+                _reg, handle = hit
+
+        cursor_name = (
+            self._cursor_name_for_handle(handle) if handle is not None else None
+        )
+        self._set_viewer_cursor(cursor_name)
+
+    def on_da_leave(self, _controller: Gtk.EventControllerMotion) -> None:
+        """Restore the default cursor when the pointer leaves the viewer."""
+        self._set_viewer_cursor(None)
 
     # --- Export ---
 
