@@ -70,7 +70,7 @@ class AppSettings:
     """Application-wide settings editable from the UI."""
 
     resolution: int = 600
-    folder: Path = field(default_factory=lambda: Path.cwd())
+    folder: Path = field(default_factory=Path.cwd)
     defaults: AppDefaults = field(default_factory=AppDefaults)
 
 
@@ -111,7 +111,7 @@ class PageGroup:
 
 @final
 class ScannerWindow(Adw.ApplicationWindow):
-    """Main window for the scanner/page manager."""
+    """Main window for scanning, managing pages, and exporting regions."""
 
     def __init__(self, app: Adw.Application) -> None:
         super().__init__(application=app)
@@ -152,10 +152,10 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._display_offset_x: float = 0.0
         self._display_offset_y: float = 0.0
 
-        # If not None, Page Viewer shows only this region's crop instead of full page
+        # If not None, Page Viewer shows only this region’s crop instead of full page
         self._preview_region_id: str | None = None
 
-        # Map region.id -> its "eye" preview button (for highlighting)
+        # Map region.id -> its “eye” preview button (for highlighting)
         self._region_preview_buttons: dict[str, Gtk.Button] = {}
 
         # Widgets
@@ -207,7 +207,11 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._gl_uniform_sampler: int = -1
         self._gl_vbo: int | None = None
         self._gl_vao: int | None = None
-        self._gl_is_gles: bool = False
+
+        self._gl_uniform_rect_min: int = -1
+        self._gl_uniform_rect_max: int = -1
+        self._gl_uniform_border: int = -1
+        self._gl_uniform_viewport_size: int = -1
 
         # Guards
         self._suppress_group_expand_signal: bool = False
@@ -226,6 +230,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _string_list_set(store: Gtk.StringList | None, values: list[str]) -> None:
+        """Replace all items in a `Gtk.StringList` with the given values."""
         if store is None:
             return
         store.splice(0, store.get_n_items(), values)
@@ -239,6 +244,10 @@ class ScannerWindow(Adw.ApplicationWindow):
         img_w: int,
         img_h: int,
     ) -> tuple[int, int, int, int] | None:
+        """
+        Normalize `(x1, y1, x2, y2)` to top-left/bottom-right order
+        and clamp to image bounds.
+        """
         if x2 < x1:
             x1, x2 = x2, x1
         if y2 < y1:
@@ -255,25 +264,30 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _plural(n: int, singular: str, plural: str | None = None) -> str:
+        """Return a simple “n thing(s)” string with correct pluralization."""
         if plural is None:
             plural = singular + "s"
         return f"{n} {singular if n == 1 else plural}"
 
     @staticmethod
     def _rotation_ccw_from_display(label: str) -> int:
+        """Map a human-readable rotation label to a CCW angle."""
         return _ROTATION_LABEL_TO_CCW.get(label.strip(), 0)
 
     @staticmethod
     def _rotation_display_from_ccw(deg_ccw: int) -> str:
+        """Map a CCW angle to a human-readable rotation label."""
         return _CCW_TO_ROTATION_LABEL.get(deg_ccw % 360, "0°")
 
     @staticmethod
     def _crop_preset_from_display(label: str) -> CropPreset:
+        """Map a crop preset label to its internal identifier."""
         return _CROP_LABEL_TO_PRESET.get(label.strip(), "full")
 
     def _calc_preset_region(
         self, img_w: int, img_h: int, preset: CropPreset
     ) -> tuple[int, int, int, int]:
+        """Return the default region rectangle for a given preset and image size."""
         if preset == "preset_1200_1700":
             res = self._normalize_and_clamp_region(
                 1200, 1700, img_w, img_h, img_w, img_h
@@ -292,6 +306,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         y2: int,
         rotation: int = 0,
     ) -> Region:
+        """Create a new Region with a fresh UUID."""
         return Region(
             id=str(uuid.uuid4()),
             name=name,
@@ -305,6 +320,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- CSS ---
 
     def _install_css(self) -> None:
+        """Install small application-specific CSS snippets."""
         css = b"""
         .flat-paned > separator {
             color: transparent;
@@ -321,6 +337,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- SANE integration ---
 
     def _init_sane(self) -> None:
+        """Initialize the SANE backend if it has not been initialized yet."""
         if self._sane_initialized:
             return
         import sane
@@ -329,6 +346,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._sane_initialized = True
 
     def _exit_sane(self) -> None:
+        """Shut down the SANE backend if it is active."""
         if not self._sane_initialized:
             return
         import sane
@@ -337,20 +355,20 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._sane_initialized = False
 
     def _list_sane_devices(self) -> list[tuple[str, str, str, str]]:
+        """Return the list of available SANE scanner devices."""
         import sane
 
         self._init_sane()
         return sane.get_devices()
 
     def _start_initial_sane_init(self) -> None:
+        """Kick off initial SANE initialization and device detection."""
         self._set_scanning_buttons_state(False)
-        self._set_progress(0, 0, "Initializing scanner...")
-        threading.Thread(
-            target=self._initial_sane_worker,
-            daemon=True,
-        ).start()
+        self._set_progress(0, 0, "Initializing scanner…")
+        threading.Thread(target=self._initial_sane_worker, daemon=True).start()
 
     def _update_device_store_and_selection(self) -> None:
+        """Update the device combo model and select a preferred device, if any."""
         display = [
             f"{name} ({vendor} {model})"
             for name, vendor, model, _ in self.available_devices
@@ -358,7 +376,6 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         self._suppress_scanner_row_signal = True
         try:
-            # Updating the model can change the selected row and emit notify::selected
             self._string_list_set(self.device_store, display)
 
             prefix = "pixma:"
@@ -381,11 +398,12 @@ class ScannerWindow(Adw.ApplicationWindow):
             self._suppress_scanner_row_signal = False
 
     def _initial_sane_worker(self) -> None:
+        """Background worker for initial SANE initialization and device opening."""
         available_devices: list[tuple[str, str, str, str]] = []
         err: str | None = None
 
         try:
-            self._set_progress(1, 3, "Detecting scanners...")
+            self._set_progress(1, 3, "Detecting scanners…")
             available_devices = self._list_sane_devices()
         except Exception as e:
             err = f"Failed to initialize scanner: {e}"
@@ -403,7 +421,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             self.available_devices = available_devices
             self._update_device_store_and_selection()
 
-            self._set_progress(2, 3, "Opening scanner...")
+            self._set_progress(2, 3, "Opening scanner…")
             if self.selected_device_name is not None:
                 self._apply_scanner()
 
@@ -415,6 +433,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- UI construction ---
 
     def _build_ui(self) -> None:
+        """Construct the main window layout (sidebar + content)."""
         nav_split = Adw.NavigationSplitView()
         nav_split.set_min_sidebar_width(380)
         nav_split.set_max_sidebar_width(500)
@@ -555,6 +574,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         vexpand: bool = True,
         pad_title: bool = True,
     ) -> Gtk.Box:
+        """Create a simple card-style box with an optional title."""
         spacing = 6 if pad_title else 0
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
         outer.set_hexpand(hexpand)
@@ -580,6 +600,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def _create_scrolled_list(
         self, *, separate: bool = False
     ) -> tuple[Gtk.ScrolledWindow, Gtk.ListBox]:
+        """Create a scrolled `ListBox` with standard margins and styling."""
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scrolled.set_hexpand(True)
@@ -606,6 +627,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         return scrolled, lb
 
     def _icon_only_button(self, icon_name: str, tooltip: str) -> Gtk.Button:
+        """Create a flat button that only shows an icon and optional tooltip."""
         btn = Gtk.Button()
         img = Gtk.Image.new_from_icon_name(icon_name)
         btn.set_child(img)
@@ -621,6 +643,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         title: str,
         subtitle: str,
     ) -> None:
+        """Append a disabled placeholder row with title and subtitle."""
         row = Adw.ActionRow()
         row.set_title(title)
         row.set_subtitle(subtitle)
@@ -631,6 +654,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     @staticmethod
     def _set_many_sensitive(enabled: bool, *widgets: Gtk.Widget | None) -> None:
+        """Set the sensitivity of multiple widgets at once."""
         for w in widgets:
             if w is not None:
                 w.set_sensitive(enabled)
@@ -638,6 +662,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Sidebar: settings + groups ---
 
     def _build_scanner_settings(self, parent: Gtk.Box) -> None:
+        """Build the scanner and global settings section in the sidebar."""
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         parent.append(outer)
 
@@ -718,6 +743,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         settings_list.append(self.folder_entry)
 
     def _build_groups_panel(self, parent: Gtk.Box) -> None:
+        """Build the Groups and Pages section in the sidebar."""
         grp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         grp_box.set_hexpand(True)
         grp_box.set_vexpand(True)
@@ -753,6 +779,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Bottom pane: regions list ---
 
     def _build_regions_panel(self, parent: Gtk.Box) -> None:
+        """Build the Regions list panel."""
         reg_box = self._build_card(
             parent, "Regions", hexpand=True, vexpand=True, pad_title=True
         )
@@ -763,11 +790,11 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Top pane: page viewer ---
 
     def _build_page_panel(self, parent: Gtk.Box) -> None:
+        """Build the Page Viewer panel with GL rendering and gestures."""
         viewer_box = self._build_card(
             parent, "Page Viewer", hexpand=True, vexpand=True, pad_title=True
         )
 
-        # Use GLArea instead of DrawingArea
         self.drawing_area = Gtk.GLArea()
         self.drawing_area.add_css_class("card")
         self.drawing_area.set_hexpand(True)
@@ -777,16 +804,11 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.drawing_area.set_margin_start(6)
         self.drawing_area.set_margin_end(6)
 
-        # Let GLArea render whenever GTK thinks it needs redraw
-        # self.drawing_area.set_auto_render(True)
-
-        # GL render and cleanup
         self.drawing_area.connect("render", self.on_gl_render)
         self.drawing_area.connect("unrealize", self.on_glarea_unrealize)
 
         viewer_box.append(self.drawing_area)
 
-        # Gestures work exactly the same; they attach to the GLArea widget
         gesture_click = Gtk.GestureClick.new()
         gesture_click.set_button(Gdk.BUTTON_PRIMARY)
         gesture_click.connect("pressed", self.on_da_press)
@@ -798,6 +820,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.drawing_area.add_controller(gesture_drag)
 
     def _show_cancel_button(self, show: bool) -> None:
+        """Show or hide the scan-cancel button."""
         self.sidebar_btn_cancel_scan.set_visible(show)
         self.sidebar_btn_cancel_scan.set_sensitive(show)
 
@@ -806,6 +829,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def on_scanner_row_changed(
         self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec
     ) -> None:
+        """Handle selection changes in the scanner device combo row."""
         if self._suppress_scanner_row_signal:
             return
 
@@ -825,6 +849,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._apply_scanner()
 
     def on_dpi_changed(self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec) -> None:
+        """Handle resolution (DPI) changes from the combo row."""
         idx = self.dpi_combo.get_selected()
         if idx < 0 or idx >= self.dpi_store.get_n_items():
             return
@@ -848,6 +873,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 self._warning_dialog("Scanner", f"Failed to set resolution: {e}")
 
     def on_mode_changed(self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec) -> None:
+        """Handle scan mode changes from the combo row."""
         idx = self.mode_combo.get_selected()
         if idx < 0 or idx >= self.mode_store.get_n_items():
             return
@@ -866,11 +892,11 @@ class ScannerWindow(Adw.ApplicationWindow):
         paned: Gtk.Paned,
         _pspec: GObject.ParamSpec,
     ) -> None:
+        """Swap viewer/regions panels when the split orientation changes."""
         viewer_box = self._viewer_paned_viewer_box
         regions_box = self._viewer_paned_regions_box
 
         if paned.get_orientation() == Gtk.Orientation.HORIZONTAL:
-            # Horizontal: regions left (start), preview right (end)
             if (
                 paned.get_start_child() is not regions_box
                 or paned.get_end_child() is not viewer_box
@@ -881,7 +907,6 @@ class ScannerWindow(Adw.ApplicationWindow):
                 paned.set_end_child(viewer_box)
                 regions_box.set_margin_top(0)
         else:
-            # Vertical: preview above (start), regions below (end)
             if (
                 paned.get_start_child() is not viewer_box
                 or paned.get_end_child() is not regions_box
@@ -892,23 +917,22 @@ class ScannerWindow(Adw.ApplicationWindow):
                 paned.set_end_child(regions_box)
                 regions_box.set_margin_top(6)
 
-        # Reapply the split position for the new orientation
         GLib.idle_add(self._apply_viewer_paned_ratio, paned)
 
     def _apply_viewer_paned_ratio(self, paned: Gtk.Paned) -> None:
-        """Set paned.position so preview and regions each get ~half the space."""
+        """Set the paned divider to roughly half of available space."""
         alloc = paned.get_allocation()
-        if paned.get_orientation() == Gtk.Orientation.VERTICAL:
-            total = alloc.height
-        else:
-            total = alloc.width
-
+        total = (
+            alloc.height
+            if paned.get_orientation() == Gtk.Orientation.VERTICAL
+            else alloc.width
+        )
         if total <= 0:
             return
-
         paned.set_position(total // 2)
 
     def _sync_default_rot_combo_from_settings(self) -> None:
+        """Synchronize the default rotation combo with current settings."""
         label = self._rotation_display_from_ccw(
             self.settings.defaults.default_rotation_ccw
         )
@@ -921,6 +945,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def on_default_rotation_changed(
         self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec
     ) -> None:
+        """Handle changes to the default page rotation setting."""
         idx = self.default_rot_combo.get_selected()
         label = _ROTATION_LABELS[idx]
         self.settings.defaults.default_rotation_ccw = self._rotation_ccw_from_display(
@@ -930,6 +955,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def on_default_crop_preset_changed(
         self, _row: Adw.ComboRow, _pspec: GObject.ParamSpec
     ) -> None:
+        """Handle changes to the default crop preset setting."""
         idx = self.default_crop_combo.get_selected()
         label = _CROP_PRESET_LABELS[idx]
         self.settings.defaults.default_crop_preset = self._crop_preset_from_display(
@@ -937,22 +963,21 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
     def on_folder_changed(self, _row: Adw.EntryRow, _pspec: GObject.ParamSpec) -> None:
+        """Handle manual edits to the output folder entry."""
         self.settings.folder = Path(self.folder_entry.get_text().strip()).expanduser()
 
     def on_browse_folder(self, _button: Gtk.Button) -> None:
+        """Open a folder chooser dialog for the export output folder."""
         dialog = Gtk.FileDialog.new()
         dialog.set_title("Select output folder")
-        dialog.select_folder(
-            self,
-            None,
-            self._on_folder_dialog_response,
-        )
+        dialog.select_folder(self, None, self._on_folder_dialog_response)
 
     def _on_folder_dialog_response(
         self,
         dialog: Gtk.FileDialog,
         result: Gio.AsyncResult,
     ) -> None:
+        """Handle completion of the output folder selection dialog."""
         try:
             folder = dialog.select_folder_finish(result)
         except GLib.Error:
@@ -964,6 +989,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Header titles ---
 
     def _update_header_titles(self) -> None:
+        """Update window titles based on current group/page selection."""
         self.sidebar_title.set_title("Scanner Page Manager")
         self.sidebar_title.set_subtitle(_SIDEBAR_DUMMY_SUBTITLE)
 
@@ -1013,14 +1039,13 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Scanner/device helpers ---
 
     def _refresh_scanner_list(self) -> None:
+        """Refresh the list of SANE devices in the scanner combo."""
         self._set_scanning_buttons_state(False)
-        self._set_progress(0, 0, "Detecting scanners...")
-        threading.Thread(
-            target=self._refresh_scanner_list_worker,
-            daemon=True,
-        ).start()
+        self._set_progress(0, 0, "Detecting scanners…")
+        threading.Thread(target=self._refresh_scanner_list_worker, daemon=True).start()
 
     def _refresh_scanner_list_worker(self) -> None:
+        """Background worker to fetch SANE device list."""
         available_devices: list[tuple[str, str, str, str]] = []
         err: str | None = None
 
@@ -1046,6 +1071,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         GLib.idle_add(finish)
 
     def _populate_dpi_combo_from_scanner(self, dev: "sane.SaneDev") -> None:
+        """Populate the resolution combo using the scanner’s resolution option."""
         cur_res = self.settings.resolution
         candidates: list[int] = []
 
@@ -1100,6 +1126,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.dpi_combo.set_selected(idx)
 
     def _populate_mode_combo_from_scanner(self, dev: "sane.SaneDev") -> None:
+        """Populate the scan mode combo using the scanner’s mode option."""
         modes: list[str] = []
         try:
             opt = dev.opt["mode"]  # type: ignore[index]
@@ -1134,6 +1161,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.mode_combo.set_selected(idx)
 
     def _apply_scanner(self) -> None:
+        """Open the selected scanner device and sync its options to the UI."""
         import sane
 
         if self.scanner_dev is not None:
@@ -1168,6 +1196,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def _show_message_dialog(
         self, title: str, text: str, appearance: Adw.ResponseAppearance
     ) -> None:
+        """Show a simple one-button alert dialog."""
         dialog = Adw.AlertDialog.new(title, text)
         dialog.add_response("ok", "_OK")
         dialog.set_default_response("ok")
@@ -1176,12 +1205,15 @@ class ScannerWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _error_dialog(self, title: str, text: str) -> None:
+        """Show an error dialog with destructive styling."""
         self._show_message_dialog(title, text, Adw.ResponseAppearance.DESTRUCTIVE)
 
     def _info_dialog(self, title: str, text: str) -> None:
+        """Show an informational dialog."""
         self._show_message_dialog(title, text, Adw.ResponseAppearance.SUGGESTED)
 
     def _warning_dialog(self, title: str, text: str) -> None:
+        """Show a warning dialog."""
         self._show_message_dialog(title, text, Adw.ResponseAppearance.SUGGESTED)
 
     def _confirm_dialog(
@@ -1194,6 +1226,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         confirm_appearance: Adw.ResponseAppearance = Adw.ResponseAppearance.DESTRUCTIVE,
         callback: Callable[[bool], None] | None = None,
     ) -> None:
+        """Show a yes/no style confirmation dialog and invoke a callback."""
         dialog = Adw.AlertDialog.new(title, text)
 
         dialog.add_response("cancel", cancel_label)
@@ -1212,6 +1245,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- List refresh (groups/pages/regions) ---
 
     def _clear_listbox(self, lb: Gtk.ListBox | None) -> None:
+        """Remove all children from a `ListBox`."""
         if lb is None:
             return
         child = lb.get_first_child()
@@ -1221,6 +1255,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             child = nxt
 
     def refresh_groups_list(self) -> None:
+        """Rebuild the Groups/Pages list UI from the current model."""
         expanded_ids: set[str] = set()
         child = self.groups_list.get_first_child()
         while child is not None:
@@ -1248,7 +1283,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             for gi, grp in enumerate(self.page_groups):
                 grp_row = Adw.ExpanderRow()
                 grp_row.set_title(grp.name)
-                grp_row.set_subtitle(f"{len(grp.pages)} page(s)")
+                grp_row.set_subtitle(self._plural(len(grp.pages), "page"))
                 setattr(grp_row, "_group_index", gi)
                 setattr(grp_row, "_group_id", grp.id)
 
@@ -1318,10 +1353,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                             g, p
                         ),
                     )
-                    drag_source.connect(
-                        "drag-begin",
-                        lambda source, drag: self._on_page_drag_begin(source, drag),
-                    )
+                    drag_source.connect("drag-begin", self._on_page_drag_begin)
                     drag_handle.add_controller(drag_source)
 
                     drop_target = Gtk.DropTarget.new(GLib.Variant, Gdk.DragAction.MOVE)
@@ -1374,7 +1406,6 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._clear_listbox(self.regions_list)
         self._region_preview_buttons.clear()
 
-        # Always keep the header in sync with current selection
         self._update_header_titles()
 
         if not self.selected_page:
@@ -1430,19 +1461,14 @@ class ScannerWindow(Adw.ApplicationWindow):
 
             suffixes: list[Gtk.Widget] = []
 
-            # Preview ("eye") button
             preview_btn = self._icon_only_button(
                 "view-reveal-symbolic",
                 "Preview region",
             )
-
-            # Remember this button for highlighting
             self._region_preview_buttons[reg.id] = preview_btn
-
             preview_btn.connect("clicked", lambda _b, idx=i: self.preview_region(idx))
             suffixes.append(preview_btn)
 
-            # Rotate region 90° CCW
             btn_rot_ccw = self._icon_only_button(
                 "object-rotate-left-symbolic",
                 "Rotate region 90° counter-clockwise",
@@ -1453,7 +1479,6 @@ class ScannerWindow(Adw.ApplicationWindow):
             )
             suffixes.append(btn_rot_ccw)
 
-            # Rotate region 90° CW
             btn_rot_cw = self._icon_only_button(
                 "object-rotate-right-symbolic",
                 "Rotate region 90° clockwise",
@@ -1506,6 +1531,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 right: Adw.EntryRow = right_row,
                 bottom: Adw.EntryRow = bottom_row,
             ) -> None:
+                """Apply edited coordinates from the entries to the region."""
                 if not self.selected_page or not (
                     0 <= idx < len(self.selected_page.regions)
                 ):
@@ -1547,7 +1573,6 @@ class ScannerWindow(Adw.ApplicationWindow):
                 exp_row.set_subtitle(subtitle2)
                 self.drawing_area.queue_render()
 
-            # Preset combo: "(Choose)" + real presets; "(Choose)" selected by default
             preset_model = Gtk.StringList.new(list(_REGION_CROP_PRESET_LABELS))
             preset_row = Adw.ComboRow(title="Preset", model=preset_model)
             preset_row.set_selected(0)
@@ -1562,6 +1587,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 right: Adw.EntryRow = right_row,
                 bottom: Adw.EntryRow = bottom_row,
             ) -> None:
+                """Handle preset selection for a region and update coordinates."""
                 if not self.selected_page or not (
                     0 <= idx < len(self.selected_page.regions)
                 ):
@@ -1585,12 +1611,10 @@ class ScannerWindow(Adw.ApplicationWindow):
                 finally:
                     self._suppress_region_coord_update = False
 
-                # Apply immediately after preset selection
                 apply_coords()
 
             preset_row.connect("notify::selected", on_preset_selected)
 
-            # Row for misc actions (rounding etc.)
             actions_row = Adw.ActionRow(title="Actions")
             actions_row.set_activatable(False)
 
@@ -1602,7 +1626,6 @@ class ScannerWindow(Adw.ApplicationWindow):
 
             row.add_row(actions_row)
 
-            # Separate Apply button row, visually emphasized
             apply_row = Adw.ButtonRow(title="Apply coordinates", activatable=True)
             apply_row.connect("activated", lambda _r, f=apply_coords: f())
             row.add_row(apply_row)
@@ -1615,6 +1638,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 right: Adw.EntryRow = right_row,
                 bottom: Adw.EntryRow = bottom_row,
             ) -> None:
+                """Round the region coordinates to multiples of 10 and apply."""
                 if not self.selected_page or not (
                     0 <= idx < len(self.selected_page.regions)
                 ):
@@ -1650,21 +1674,19 @@ class ScannerWindow(Adw.ApplicationWindow):
                 finally:
                     self._suppress_region_coord_update = False
 
-                # Commit rounded coordinates immediately
                 apply_coords()
 
             round_btn.connect("clicked", round_coords)
 
             self.regions_list.append(row)
 
-        # After all rows/buttons are created, sync eye highlights
         self._refresh_preview_eye_highlight()
-
         self.drawing_area.queue_render()
 
     # --- Copy/paste regions ---
 
     def copy_regions_from_page(self) -> None:
+        """Copy all regions from the currently selected page into a buffer."""
         if not self.selected_page:
             self._info_dialog("Copy regions", "No page selected.")
             return
@@ -1686,6 +1708,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
     def paste_regions_to_page(self) -> None:
+        """Paste previously copied regions into the currently selected page."""
         if not self.selected_page:
             self._info_dialog("Paste regions", "No page selected.")
             return
@@ -1708,6 +1731,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Region management ---
 
     def rename_region(self, idx: int) -> None:
+        """Prompt the user to rename a region."""
         if not self.selected_page:
             return
         if not (0 <= idx < len(self.selected_page.regions)):
@@ -1720,15 +1744,10 @@ class ScannerWindow(Adw.ApplicationWindow):
                 reg.name = new_name
                 self.refresh_regions_list()
 
-        simple_prompt_async(
-            self,
-            "Rename region",
-            "Region name:",
-            reg.name,
-            done,
-        )
+        simple_prompt_async(self, "Rename region", "Region name:", reg.name, done)
 
     def delete_region(self, idx: int) -> None:
+        """Delete a region after confirmation."""
         if not self.selected_page:
             return
         if not (0 <= idx < len(self.selected_page.regions)):
@@ -1784,22 +1803,18 @@ class ScannerWindow(Adw.ApplicationWindow):
         page = self.selected_page
         reg = page.regions[idx]
 
-        # Toggle: clicking the same region again turns preview off.
         if self._preview_region_id == reg.id:
             self._preview_region_id = None
         else:
             self._preview_region_id = reg.id
 
-        # Update eye button highlighting based on the new preview id
         self._refresh_preview_eye_highlight()
-
-        # IMPORTANT: do NOT touch expanded_region_ids here; we don't want
-        # previously previewed regions to become red in the page viewer.
         self.drawing_area.queue_render()
 
     # --- Group/page selection ---
 
     def _on_group_row_expanded(self, row: Adw.ExpanderRow, group_idx: int) -> None:
+        """When a group row expands, select its group and ensure a page is selected."""
         if self._suppress_group_expand_signal:
             return
         if not row.get_expanded():
@@ -1813,6 +1828,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.refresh_regions_list()
 
     def on_page_row_activated(self, group_idx: int, page_idx: int) -> None:
+        """Handle activation of a page row in the groups list."""
         if not (0 <= group_idx < len(self.page_groups)):
             return
         grp = self.page_groups[group_idx]
@@ -1826,12 +1842,14 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Per-index helpers ---
 
     def _scan_into_group_index(self, idx: int) -> None:
+        """Start a scan and append the new page to the given group index."""
         if not (0 <= idx < len(self.page_groups)):
             return
         self.selected_group = self.page_groups[idx]
         self._start_scan("into_group")
 
     def _delete_group_index(self, idx: int) -> None:
+        """Delete a group identified by its index."""
         if not (0 <= idx < len(self.page_groups)):
             return
         self.selected_group = self.page_groups[idx]
@@ -1840,6 +1858,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     def _rotate_page_index(
         self, group_idx: int, page_idx: int, degrees_cw: int
     ) -> None:
+        """Rotate the page identified by group/page indices."""
         if not (0 <= group_idx < len(self.page_groups)):
             return
         grp = self.page_groups[group_idx]
@@ -1850,6 +1869,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.rotate_page(degrees_cw)
 
     def _delete_page_index(self, group_idx: int, page_idx: int) -> None:
+        """Delete the page identified by group/page indices."""
         if not (0 <= group_idx < len(self.page_groups)):
             return
         grp = self.page_groups[group_idx]
@@ -1862,6 +1882,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Group management ---
 
     def rename_group(self) -> None:
+        """Prompt the user to rename the currently selected group."""
         if not self.selected_group:
             return
 
@@ -1880,6 +1901,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
     def delete_group(self) -> None:
+        """Delete the currently selected group and all its pages."""
         if not self.selected_group:
             return
 
@@ -1906,6 +1928,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
     def clear_groups(self) -> None:
+        """Remove all groups, pages, and regions from the session."""
         if not self.page_groups:
             return
 
@@ -1929,6 +1952,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Page management ---
 
     def delete_page(self) -> None:
+        """Delete the currently selected page from its group."""
         if not self.selected_group or not self.selected_page:
             return
         grp = self.selected_group
@@ -1962,11 +1986,13 @@ class ScannerWindow(Adw.ApplicationWindow):
     def _on_page_drag_prepare(
         self, group_idx: int, page_idx: int
     ) -> Gdk.ContentProvider:
+        """Prepare drag data describing the source group/page indices."""
         data = f"{group_idx}:{page_idx}"
         variant = GLib.Variant("s", data)
         return Gdk.ContentProvider.new_for_value(variant)
 
     def _on_page_drag_begin(self, _source: Gtk.DragSource, drag: Gdk.Drag) -> None:
+        """Set a simple icon for page drag operations."""
         icon = Gtk.DragIcon.get_for_drag(drag)
         image = Gtk.Image.new_from_icon_name("x-office-document")
         image.set_pixel_size(24)
@@ -1978,6 +2004,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         dest_group_idx: int,
         dest_page_idx: int | None,
     ) -> bool:
+        """Handle dropping a dragged page onto another page/group."""
         if value is None:
             return False
         try:
@@ -2002,6 +2029,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         dest_group_idx: int,
         dest_page_idx: int | None,
     ) -> None:
+        """Move a page from one group/index to another."""
         if not (0 <= src_group_idx < len(self.page_groups)):
             return
         if not (0 <= dest_group_idx < len(self.page_groups)):
@@ -2037,6 +2065,8 @@ class ScannerWindow(Adw.ApplicationWindow):
     def _set_progress(
         self, current: int | None, total: int | None, text: str | None
     ) -> None:
+        """Update the sidebar progress bar and subtitle from a background task."""
+
         def update() -> None:
             if current is None or total in (None, 0):
                 frac = 0.0
@@ -2053,9 +2083,11 @@ class ScannerWindow(Adw.ApplicationWindow):
         GLib.idle_add(update)
 
     def _reset_progress(self) -> None:
+        """Reset the sidebar progress bar and subtitle."""
         self._set_progress(0, 1, _SIDEBAR_DUMMY_SUBTITLE)
 
     def _set_scanning_buttons_state(self, enabled: bool) -> None:
+        """Enable or disable UI elements while scanning/exporting."""
         self._set_many_sensitive(
             enabled,
             self.btn_new_group,
@@ -2077,6 +2109,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Scanning (async) ---
 
     def _start_scan(self, mode: Literal["new_group", "into_group"]) -> None:
+        """Start a background scan, either into a new group or the selected group."""
         if not self.scanner_dev:
             self._error_dialog("Scanner error", "Scanner not initialized.")
             return
@@ -2091,7 +2124,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 return
             self._scan_cancel_event.clear()
             self._set_scanning_buttons_state(False)
-            self._set_progress(0, 1, "Scanning...")
+            self._set_progress(0, 1, "Scanning…")
             self._show_cancel_button(True)
             self._scan_thread = threading.Thread(
                 target=self._scan_worker, args=(mode,), daemon=True
@@ -2099,11 +2132,13 @@ class ScannerWindow(Adw.ApplicationWindow):
             self._scan_thread.start()
 
     def on_cancel_scan_clicked(self, _button: Gtk.Button) -> None:
+        """Signal the current scan to cancel, if possible."""
         self._scan_cancel_event.set()
         self.sidebar_btn_cancel_scan.set_sensitive(False)
-        self._set_progress(None, None, "Cancelling scan...")
+        self._set_progress(None, None, "Cancelling scan…")
 
     def _scan_worker(self, mode: Literal["new_group", "into_group"]) -> None:
+        """Background scan worker that produces one Page and updates the model."""
         dev = self.scanner_dev
         if not dev:
             GLib.idle_add(self._set_scanning_buttons_state, True)
@@ -2145,6 +2180,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         GLib.idle_add(finish)
 
     def _scan_one_image(self, dev: "sane.SaneDev") -> PILImage.Image | None:
+        """Scan a single image from the device and return it as a PIL image."""
+
         def progress(current: int, total: int) -> None:
             if self._scan_cancel_event.is_set():
                 try:
@@ -2152,7 +2189,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 except Exception:
                     pass
                 return
-            self._set_progress(current, total, "Scanning...")
+            self._set_progress(current, total, "Scanning…")
 
         try:
             np_arr = dev.arr_scan(progress=progress)
@@ -2163,7 +2200,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             print(f"Scan failed: {e!r}")
             return None
 
-        self._set_progress(1, 1, "Processing...")
+        self._set_progress(1, 1, "Processing…")
 
         try:
             pil_img = PILImage.fromarray(np_arr)
@@ -2181,6 +2218,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Page/region creation and rotation ---
 
     def _page_from_pil(self, pil_img: PILImage.Image) -> Page:
+        """Create a Page object with a default region from a scanned PIL image."""
         w, h = pil_img.size
         preset = self.settings.defaults.default_crop_preset
         x1, y1, x2, y2 = self._calc_preset_region(w, h, preset)
@@ -2200,6 +2238,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
     def rotate_page(self, degrees_cw: int) -> None:
+        """Rotate the selected page and all its regions by the given angle."""
         if not self.selected_page:
             return
         page = self.selected_page
@@ -2218,6 +2257,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         orig_w: int,
         orig_h: int,
     ) -> None:
+        """Update all region coordinates after a page rotation."""
         w, h = orig_w, orig_h
         d = degrees_cw % 360
         if d == 0:
@@ -2239,14 +2279,10 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     # --- DrawingArea (image + regions) ---
 
-    def _get_display_pil_image(
-        self,
-    ) -> tuple[PILImage.Image, Region | None]:
+    def _get_display_pil_image(self) -> tuple[PILImage.Image, Region | None]:
         """
-        Return the PIL image that should currently be shown in the preview,
-        taking region preview and per-region rotation into account.
-
-        Returns (image, region) where region is None if showing full page.
+        Return the PIL image currently shown in the viewer, optionally cropped
+        and rotated for a previewed region.
         """
         assert self.selected_page is not None
 
@@ -2260,19 +2296,16 @@ class ScannerWindow(Adw.ApplicationWindow):
                 None,
             )
             if reg is None:
-                # Region disappeared (deleted). Stop previewing.
                 self._preview_region_id = None
             else:
                 try:
                     crop = pil_img.crop((reg.x1, reg.y1, reg.x2, reg.y2))
                 except Exception:
-                    # Cropping failed – fall back to full page.
                     self._preview_region_id = None
                     reg = None
                 else:
                     rot = reg.rotation % 360
                     if rot:
-                        # PIL rotates CCW for positive angles; negate for CW
                         crop = crop.rotate(-rot, expand=True)
                     pil_img = crop
 
@@ -2291,10 +2324,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         ch = max(1, canvas_h)
 
         if preview_active:
-            # In preview mode we let the image fill the full area
             cwp, chp = cw, ch
         else:
-            # Leave a bit of room so the region border isn't clipped
             cwp = max(1, cw - _REGION_BORDER_WIDTH)
             chp = max(1, ch - _REGION_BORDER_WIDTH)
 
@@ -2309,69 +2340,86 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._display_offset_x = (cw - disp_w) / 2.0
         self._display_offset_y = (ch - disp_h) / 2.0
 
-    def _get_glsl_sources(self, is_gles: bool) -> tuple[str, str]:
-        if is_gles:
-            vert = """
-                #version 100
-                precision mediump float;
-                attribute vec2 aPos;
-                attribute vec2 aTexCoord;
-                varying vec2 vTexCoord;
-                void main() {
-                    gl_Position = vec4(aPos, 0.0, 1.0);
-                    vTexCoord = aTexCoord;
-                }
-            """
-            frag = """
-                #version 100
-                precision mediump float;
-                varying vec2 vTexCoord;
-                uniform sampler2D uTexture;
-                uniform bool uUseTexture;
-                uniform vec4 uColor;
-                void main() {
-                    if (uUseTexture) {
-                        gl_FragColor = texture2D(uTexture, vTexCoord);
-                    } else {
-                        gl_FragColor = uColor;
+    def _get_glsl_sources(self) -> tuple[str, str]:
+        """Return GLSL source strings for the textured quad and SDF border shaders."""
+        vert = """
+            #version 100
+            precision mediump float;
+            attribute vec2 aPos;
+            attribute vec2 aTexCoord;
+            varying vec2 vTexCoord;
+            void main() {
+                gl_Position = vec4(aPos, 0.0, 1.0);
+                vTexCoord = aTexCoord;
+            }
+        """
+        frag = """
+            #version 100
+            #extension GL_OES_standard_derivatives : enable
+            precision mediump float;
+            varying vec2 vTexCoord;
+
+            uniform sampler2D uTexture;
+            uniform bool uUseTexture;
+            uniform vec4 uColor;
+
+            // SDF uniforms
+            uniform vec2 uRectMin;        // top-left in canvas px (path rect)
+            uniform vec2 uRectMax;        // bottom-right in canvas px
+            uniform float uBorder;        // stroke width in px
+            uniform vec2 uViewportSize;   // (width, height) in px
+
+            void main() {
+                if (uUseTexture) {
+                    gl_FragColor = texture2D(uTexture, vTexCoord);
+                } else {
+                    // Fragment position in canvas coordinates, origin at top-left
+                    vec2 fragPx = vec2(gl_FragCoord.x,
+                                       uViewportSize.y - gl_FragCoord.y);
+
+                    // Rect center and half-size in px (this is the "path" rect)
+                    vec2 rectCenter = 0.5 * (uRectMin + uRectMax);
+                    vec2 halfSize   = 0.5 * (uRectMax - uRectMin);
+
+                    // Clamp radius to not exceed half the minimum dimension
+                    float r = min(uBorder, min(halfSize.x, halfSize.y));
+
+                    // Signed distance to rounded rectangle from
+                    // https://iquilezles.org/articles/distfunctions2d/
+                    vec2 p = fragPx - rectCenter;
+                    vec2 q = abs(p) - halfSize + r;
+                    float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+
+                    // Stroke width uBorder, centered on the distance=0 contour:
+                    float halfB = 0.5 * uBorder;
+
+                    // Anti-aliasing width in pixels
+                    float aa = max(fwidth(dist), 1.0);
+
+                    // We want the band |dist| <= halfB to be opaque.
+                    // dist_abs <= halfB - aa  => alpha ~ 1
+                    // dist_abs >= halfB + aa  => alpha ~ 0
+                    float dist_abs = abs(dist);
+                    float a = halfB - aa;
+                    float b = halfB + aa;
+                    float alpha = 1.0 - smoothstep(a, b, dist_abs);
+
+                    if (alpha <= 0.0) {
+                        discard;
                     }
+
+                    gl_FragColor = uColor * alpha;
                 }
-            """
-        else:
-            vert = """
-                #version 150
-                in vec2 aPos;
-                in vec2 aTexCoord;
-                out vec2 vTexCoord;
-                void main() {
-                    gl_Position = vec4(aPos, 0.0, 1.0);
-                    vTexCoord = aTexCoord;
-                }
-            """
-            frag = """
-                #version 150
-                in vec2 vTexCoord;
-                out vec4 fragColor;
-                uniform sampler2D uTexture;
-                uniform bool uUseTexture;
-                uniform vec4 uColor;
-                void main() {
-                    if (uUseTexture) {
-                        fragColor = texture(uTexture, vTexCoord);
-                    } else {
-                        fragColor = uColor;
-                    }
-                }
-            """
+            }
+        """
         return vert, frag
 
     def _init_gl_resources(self, context: Gdk.GLContext) -> None:
+        """Compile shaders and set up GL buffers the first time we get a context."""
         if self._gl_program != 0:
             return
 
-        # Decide whether this is GLES or desktop GL
-        self._gl_is_gles = bool(getattr(context, "get_use_es", lambda: False)())
-        vert_src, frag_src = self._get_glsl_sources(self._gl_is_gles)
+        vert_src, frag_src = self._get_glsl_sources()
 
         def compile_shader(src: str, shader_type: int) -> int:
             sid = GL.glCreateShader(shader_type)
@@ -2396,7 +2444,6 @@ class ScannerWindow(Adw.ApplicationWindow):
             log = GL.glGetProgramInfoLog(prog).decode("utf-8", "ignore")
             raise RuntimeError(f"Program link failed: {log}")
 
-        # We can delete shaders once linked
         GL.glDetachShader(prog, vs)
         GL.glDetachShader(prog, fs)
         GL.glDeleteShader(vs)
@@ -2409,16 +2456,20 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._gl_uniform_color = GL.glGetUniformLocation(prog, "uColor")
         self._gl_uniform_sampler = GL.glGetUniformLocation(prog, "uTexture")
 
+        self._gl_uniform_rect_min = GL.glGetUniformLocation(prog, "uRectMin")
+        self._gl_uniform_rect_max = GL.glGetUniformLocation(prog, "uRectMax")
+        self._gl_uniform_border = GL.glGetUniformLocation(prog, "uBorder")
+        self._gl_uniform_viewport_size = GL.glGetUniformLocation(prog, "uViewportSize")
+
         self._gl_vbo = GL.glGenBuffers(1)
 
-        # Core profiles require a VAO; GLES allows 0 but binding one is harmless.
         self._gl_vao = None
         if hasattr(GL, "glGenVertexArrays"):
             self._gl_vao = GL.glGenVertexArrays(1)
 
     def _ensure_gl_texture(self, canvas_w: int, canvas_h: int) -> bool:
         """
-        Ensure we have a GL texture for the current page/preview.
+        Ensure we have a GL texture for the current page or region preview.
 
         Returns False if there is nothing to draw.
         """
@@ -2431,7 +2482,6 @@ class ScannerWindow(Adw.ApplicationWindow):
         img_w, img_h = pil_img.size
         preview_active = reg is not None
 
-        # Build a key that changes whenever the texture contents must change.
         if reg is None:
             key: (
                 tuple[str, int, int, str]
@@ -2452,12 +2502,10 @@ class ScannerWindow(Adw.ApplicationWindow):
             )
 
         if key != self._gl_tex_key:
-            # Re-upload texture data
             if pil_img.mode != "RGBA":
                 pil_img = pil_img.convert("RGBA")
             data = pil_img.tobytes("raw", "RGBA")
 
-            # Delete old texture if any
             if self._gl_tex_id:
                 GL.glDeleteTextures([self._gl_tex_id])
                 self._gl_tex_id = None
@@ -2491,24 +2539,19 @@ class ScannerWindow(Adw.ApplicationWindow):
             self._gl_tex_h = img_h
             self._gl_tex_key = key
 
-        # Geometry / scale is recomputed each frame from current canvas size
         self._gl_preview_active = preview_active
         self._update_display_geometry(canvas_w, canvas_h, img_w, img_h, preview_active)
 
         return self._gl_tex_id is not None
 
-    def on_gl_render(
-        self,
-        area: Gtk.GLArea,
-        context: Gdk.GLContext,
-    ) -> bool:
+    def on_gl_render(self, area: Gtk.GLArea, context: Gdk.GLContext) -> bool:
+        """GLArea render callback: draw the page texture and region overlays."""
         area.make_current()
         err = area.get_error()
         if err is not None:
             print(f"GLArea error: {err.message}")
             return False
 
-        # Lazy init of shaders / buffers once we have a context
         if self._gl_program == 0:
             try:
                 self._init_gl_resources(context)
@@ -2532,20 +2575,16 @@ class ScannerWindow(Adw.ApplicationWindow):
         if not self._ensure_gl_texture(width, height):
             return True
 
-        # Use our program and setup VAO/VBO
         GL.glUseProgram(self._gl_program)
         if self._gl_vao is not None:
             GL.glBindVertexArray(self._gl_vao)
         assert self._gl_vbo is not None
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._gl_vbo)
 
-        # Helper to convert canvas pixel coords to NDC [-1,1]
         def canvas_to_ndc(x: float, y: float) -> tuple[float, float]:
             nx = (2.0 * x / float(width)) - 1.0
             ny = 1.0 - (2.0 * y / float(height))
             return nx, ny
-
-        # --- Draw the page texture as a quad (two triangles) ---
 
         img_w = self._gl_tex_w
         img_h = self._gl_tex_h
@@ -2561,7 +2600,6 @@ class ScannerWindow(Adw.ApplicationWindow):
         x0n, y0n = canvas_to_ndc(x0, y0)
         x1n, y1n = canvas_to_ndc(x1, y1)
 
-        # 6 vertices: two triangles; each vertex = (x, y, u, v)
         vertices_quad = np.array(
             [
                 # first triangle
@@ -2601,7 +2639,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             GL.GL_DYNAMIC_DRAW,
         )
 
-        stride = 4 * 4  # 4 floats per vertex (x, y, u, v)
+        stride = 4 * 4
         GL.glEnableVertexAttribArray(self._gl_attr_pos)
         GL.glVertexAttribPointer(
             self._gl_attr_pos,
@@ -2622,6 +2660,7 @@ class ScannerWindow(Adw.ApplicationWindow):
         )
 
         GL.glActiveTexture(GL.GL_TEXTURE0)
+        assert self._gl_tex_id is not None
         GL.glBindTexture(GL.GL_TEXTURE_2D, self._gl_tex_id)
         GL.glUniform1i(self._gl_uniform_sampler, 0)
         GL.glUniform1i(self._gl_uniform_use_tex, 1)
@@ -2629,96 +2668,89 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
 
-        # --- Overlays (regions and drag rect) ---
-
-        # In preview mode we don't draw overlays
         if self._gl_preview_active:
             GL.glUseProgram(0)
             if self._gl_vao is not None:
                 GL.glBindVertexArray(0)
             return True
 
-        # Helper: image px -> canvas px
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
+
+        GL.glUniform2f(self._gl_uniform_viewport_size, float(width), float(height))
+        GL.glUniform1i(self._gl_uniform_use_tex, 0)
+
+        scale_factor = max(1, area.get_scale_factor())
+        border_px = float(_REGION_BORDER_WIDTH * scale_factor)
+
         def img_to_canvas(px: int, py: int) -> tuple[float, float]:
             return (
                 self._display_offset_x + px * self._display_scale,
                 self._display_offset_y + py * self._display_scale,
             )
 
-        GL.glUniform1i(self._gl_uniform_use_tex, 0)
-        thickness = float(_REGION_BORDER_WIDTH)
-        half_t = thickness / 2.0
-
-        def add_quad(
-            buf: list[float], x1c: float, y1c: float, x2c: float, y2c: float
-        ) -> None:
-            """
-            Append two triangles (one filled quad) in NDC coords
-            for the axis-aligned rectangle [x1c,x2c]×[y1c,y2c] in canvas space.
-            """
-            qx1, qy1 = canvas_to_ndc(x1c, y1c)
-            qx2, qy2 = canvas_to_ndc(x2c, y2c)
-            # two triangles: (x1,y1)-(x2,y1)-(x2,y2) and (x1,y1)-(x2,y2)-(x1,y2)
-            buf.extend(
-                [
-                    qx1,
-                    qy1,
-                    0.0,
-                    0.0,
-                    qx2,
-                    qy1,
-                    0.0,
-                    0.0,
-                    qx2,
-                    qy2,
-                    0.0,
-                    0.0,
-                    qx1,
-                    qy1,
-                    0.0,
-                    0.0,
-                    qx2,
-                    qy2,
-                    0.0,
-                    0.0,
-                    qx1,
-                    qy2,
-                    0.0,
-                    0.0,
-                ]
-            )
-
-        def draw_rect_border_canvas(
+        def draw_sdf_rounded_rect_canvas(
             x1c: float,
             y1c: float,
             x2c: float,
             y2c: float,
             color: tuple[float, float, float],
+            border_px: float,
         ) -> None:
             """
-            Draw a rectangle border given in canvas coordinates as four filled quads.
-            Handles any drag direction by normalizing coordinates.
+            Draw a rounded-rectangle border in canvas coordinates using the SDF shader.
             """
-            # normalize so left < right, top < bottom
             if x2c < x1c:
                 x1c, x2c = x2c, x1c
             if y2c < y1c:
                 y1c, y2c = y2c, y1c
 
+            w = x2c - x1c
+            h = y2c - y1c
+            if w <= 0.0 or h <= 0.0:
+                return
+
+            GL.glUniform2f(self._gl_uniform_rect_min, x1c, y1c)
+            GL.glUniform2f(self._gl_uniform_rect_max, x2c, y2c)
+            GL.glUniform1f(self._gl_uniform_border, border_px)
             GL.glUniform4f(self._gl_uniform_color, color[0], color[1], color[2], 1.0)
 
-            verts: list[float] = []
+            bx1, by1 = x1c - border_px, y1c - border_px
+            bx2, by2 = x2c + border_px, y2c + border_px
 
-            # top edge
-            add_quad(verts, x1c - half_t, y1c - half_t, x2c + half_t, y1c + half_t)
-            # bottom edge
-            add_quad(verts, x1c - half_t, y2c - half_t, x2c + half_t, y2c + half_t)
-            # left edge
-            add_quad(verts, x1c - half_t, y1c + half_t, x1c + half_t, y2c - half_t)
-            # right edge
-            add_quad(verts, x2c - half_t, y1c + half_t, x2c + half_t, y2c - half_t)
+            bx1n, by1n = canvas_to_ndc(bx1, by1)
+            bx2n, by2n = canvas_to_ndc(bx2, by2)
 
-            vertices = np.array(verts, dtype=np.float32)
+            vertices = np.array(
+                [
+                    bx1n,
+                    by1n,
+                    0.0,
+                    0.0,
+                    bx2n,
+                    by1n,
+                    0.0,
+                    0.0,
+                    bx2n,
+                    by2n,
+                    0.0,
+                    0.0,
+                    bx1n,
+                    by1n,
+                    0.0,
+                    0.0,
+                    bx2n,
+                    by2n,
+                    0.0,
+                    0.0,
+                    bx1n,
+                    by2n,
+                    0.0,
+                    0.0,
+                ],
+                dtype=np.float32,
+            )
+
             GL.glBufferData(
                 GL.GL_ARRAY_BUFFER,
                 vertices.nbytes,
@@ -2742,28 +2774,28 @@ class ScannerWindow(Adw.ApplicationWindow):
                 ctypes.c_void_p(2 * 4),
             )
 
-            # each vertex has 4 floats (x,y,u,v)
-            vertex_count = len(verts) // 4
-            GL.glDrawArrays(GL.GL_TRIANGLES, 0, vertex_count)
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, 6)
 
-        # Draw each region as a filled border
         for r in self.selected_page.regions:
             x1c, y1c = img_to_canvas(r.x1, r.y1)
             x2c, y2c = img_to_canvas(r.x2, r.y2)
+            col = (
+                (0.781, 0.094, 0.125)
+                if r.id in self.expanded_region_ids
+                else (0.128, 0.320, 0.552)
+            )
+            draw_sdf_rounded_rect_canvas(x1c, y1c, x2c, y2c, col, border_px)
 
-            if r.id in self.expanded_region_ids:
-                col = (0.781, 0.094, 0.125)  # highlighted (red-ish)
-            else:
-                col = (0.128, 0.320, 0.552)  # normal (blue-ish)
-
-            draw_rect_border_canvas(x1c, y1c, x2c, y2c, col)
-
-        # Drag rectangle (if any), same border style
         if self._drag_rect is not None:
             x1d, y1d, x2d, y2d = self._drag_rect
-            draw_rect_border_canvas(x1d, y1d, x2d, y2d, (0.781, 0.094, 0.125))
+            draw_sdf_rounded_rect_canvas(
+                x1d, y1d, x2d, y2d, (0.781, 0.094, 0.125), border_px
+            )
+
+        return False
 
     def on_glarea_unrealize(self, area: Gtk.GLArea) -> None:
+        """GLArea unrealize callback: free GL resources."""
         area.make_current()
         if area.get_error() is not None:
             return
@@ -2786,6 +2818,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             self._gl_program = 0
 
     def _canvas_to_image_coords(self, x: float, y: float) -> tuple[int, int]:
+        """Convert canvas coordinates to image pixel coordinates."""
         if not self.selected_page:
             return 0, 0
         img_w, img_h = self.selected_page.pil_image.size
@@ -2811,27 +2844,23 @@ class ScannerWindow(Adw.ApplicationWindow):
         x: float,
         y: float,
     ) -> None:
+        """Start a region drag rectangle on mouse press in the viewer."""
         if not self.selected_page:
             return
         if self._preview_region_id is not None:
-            return  # no region creation while previewing
+            return
         if n_press == 1:
             self._drag_rect = (x, y, x, y)
             self.drawing_area.queue_render()
 
-    def on_da_drag(
-        self,
-        _gesture: Gtk.GestureDrag,
-        dx: float,
-        dy: float,
-    ) -> None:
+    def on_da_drag(self, _gesture: Gtk.GestureDrag, dx: float, dy: float) -> None:
+        """Update the region drag rectangle while the mouse is dragged."""
         if self._drag_rect is None:
             return
         if self._preview_region_id is not None:
             return
         start_x, start_y, _, _ = self._drag_rect
-        cur_x = start_x + dx
-        cur_y = start_y + dy
+        cur_x, cur_y = start_x + dx, start_y + dy
         self._drag_rect = (start_x, start_y, cur_x, cur_y)
         self.drawing_area.queue_render()
 
@@ -2842,8 +2871,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         _x: float,
         _y: float,
     ) -> None:
+        """Finish region creation from a drag rectangle on mouse release."""
         if self._preview_region_id is not None:
-            # Ignore clicks/releases in preview mode
             self._drag_rect = None
             self.drawing_area.queue_render()
             return
@@ -2871,7 +2900,6 @@ class ScannerWindow(Adw.ApplicationWindow):
         reg = self._new_region(name=name, x1=ix1, y1=iy1, x2=ix2, y2=iy2)
         self.selected_page.regions.append(reg)
 
-        # New region starts expanded (and therefore highlighted)
         self.expanded_region_ids.add(reg.id)
 
         self.refresh_regions_list()
@@ -2880,18 +2908,17 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Export ---
 
     def export_changes(self) -> None:
+        """Export all regions of all pages to JPEG XL files in the output folder."""
         if not self.page_groups:
             self._info_dialog("Export", "Nothing to export.")
             return
 
         self._set_scanning_buttons_state(False)
-        self._set_progress(0, 1, "Preparing export...")
-        threading.Thread(
-            target=self._export_changes_worker,
-            daemon=True,
-        ).start()
+        self._set_progress(0, 1, "Preparing export…")
+        threading.Thread(target=self._export_changes_worker, daemon=True).start()
 
     def _export_changes_worker(self) -> None:
+        """Background export worker: crop, rotate, and save all regions."""
         out_dir = self.settings.folder
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -2899,7 +2926,7 @@ class ScannerWindow(Adw.ApplicationWindow):
             GLib.idle_add(
                 self._error_dialog,
                 "Export",
-                f"Failed to create output folder '{out_dir}': {e}",
+                f"Failed to create output folder “{out_dir}”: {e}",
             )
             GLib.idle_add(self._set_scanning_buttons_state, True)
             GLib.idle_add(self._reset_progress)
@@ -2926,7 +2953,6 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         exported_count = 0
         last_error: str | None = None
-        import numpy as np
 
         for idx, (gidx, pi, ri, page, reg) in enumerate(items, start=1):
             try:
@@ -2934,7 +2960,6 @@ class ScannerWindow(Adw.ApplicationWindow):
 
                 rot = reg.rotation % 360
                 if rot:
-                    # PIL rotates counter-clockwise for positive angles
                     crop = crop.rotate(-rot, expand=True)
 
                 if crop.mode != "RGB":
@@ -2948,7 +2973,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 last_error = str(e)
             else:
                 exported_count += 1
-            self._set_progress(idx, total, f"Exporting {idx}/{total}...")
+            self._set_progress(idx, total, f"Exporting {idx}/{total}…")
 
         def finish() -> None:
             self.refresh_regions_list()
@@ -2964,6 +2989,7 @@ class ScannerWindow(Adw.ApplicationWindow):
     # --- Cleanup ---
 
     def close_app(self) -> None:
+        """Close the scanner device, shut down SANE, and destroy the window."""
         if self.scanner_dev is not None:
             try:
                 self.scanner_dev.close()
@@ -2983,6 +3009,7 @@ def simple_prompt_async(
     initial: str,
     callback: Callable[[str | None], None],
 ) -> None:
+    """Show a simple text entry dialog and deliver the result asynchronously."""
     dialog = Adw.AlertDialog.new(title, None)
 
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -3017,23 +3044,28 @@ def simple_prompt_async(
 
 
 class ScannerApplication(Adw.Application):
+    """libadwaita Application wrapper that owns the main window."""
+
     def __init__(self) -> None:
         super().__init__(application_id="org.kurbo96.Cendar")
         self.window: ScannerWindow | None = None
 
     @override
     def do_activate(self) -> None:
+        """Create and present the main window on first activation."""
         if not self.window:
             self.window = ScannerWindow(self)
             self.window.connect("close-request", self.on_close_request)
         self.window.present()
 
     def on_close_request(self, win: ScannerWindow) -> bool:
+        """Handle the window close request by performing cleanup."""
         win.close_app()
         return True
 
 
 def run() -> None:
+    """Run the `ScannerApplication` event loop."""
     Adw.init()
     app = ScannerApplication()
     app.run(None)
