@@ -162,6 +162,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         # Drawing state.
         self._display_scale: float = 1.0
         self._drag_rect: tuple[float, float, float, float] | None = None
+        self._drag_start_x: float = 0.0
+        self._drag_start_y: float = 0.0
 
         # Current cursor shape for the viewer (None = default).
         self._viewer_cursor_name: str | None = None
@@ -3178,9 +3180,43 @@ class ScannerWindow(Adw.ApplicationWindow):
         ix = int(x_rel / self._display_scale)
         iy = int(y_rel / self._display_scale)
 
-        ix = max(0, min(ix, img_w - 1))
-        iy = max(0, min(iy, img_h - 1))
+        ix = max(0, min(ix, img_w))
+        iy = max(0, min(iy, img_h))
         return ix, iy
+
+    def _update_drag_rect(
+        self,
+        start_canvas_x: float,
+        start_canvas_y: float,
+        cur_canvas_x: float,
+        cur_canvas_y: float,
+    ) -> None:
+        """
+        Update ``self._drag_rect`` from canvas coordinates.
+
+        Converts the drag endpoints to image pixel coordinates, normalizes and
+        clamps them, then converts back to canvas coordinates so that the visual
+        drag outline matches the eventual region.
+        """
+        if not self.selected_page:
+            self._drag_rect = None
+            return
+
+        img_w = self.selected_page.image.width
+        img_h = self.selected_page.image.height
+
+        ix1, iy1 = self._canvas_to_image_coords(start_canvas_x, start_canvas_y)
+        ix2, iy2 = self._canvas_to_image_coords(cur_canvas_x, cur_canvas_y)
+
+        res = self._normalize_and_clamp_region(ix1, iy1, ix2, iy2, img_w, img_h)
+        if res is None:
+            self._drag_rect = None
+            return
+
+        nx1, ny1, nx2, ny2 = res
+        x1c, y1c = self._img_to_canvas(nx1, ny1)
+        x2c, y2c = self._img_to_canvas(nx2, ny2)
+        self._drag_rect = (x1c, y1c, x2c, y2c)
 
     def _hit_test_region_edge(
         self,
@@ -3347,7 +3383,9 @@ class ScannerWindow(Adw.ApplicationWindow):
             return
 
         if n_press == 1:
-            self._drag_rect = (x, y, x, y)
+            self._drag_start_x = x
+            self._drag_start_y = y
+            self._update_drag_rect(x, y, x, y)
             self.drawing_area.queue_render()
 
     def on_da_drag(
@@ -3364,13 +3402,16 @@ class ScannerWindow(Adw.ApplicationWindow):
             self.drawing_area.queue_render()
             return
 
-        if self._drag_rect is None:
-            return
         if self._preview_region_id is not None:
             return
-        start_x, start_y, _, _ = self._drag_rect
-        cur_x, cur_y = start_x + dx, start_y + dy
-        self._drag_rect = (start_x, start_y, cur_x, cur_y)
+        if not self.selected_page:
+            return
+
+        start_x = self._drag_start_x
+        start_y = self._drag_start_y
+        cur_x = start_x + dx
+        cur_y = start_y + dy
+        self._update_drag_rect(start_x, start_y, cur_x, cur_y)
         self.drawing_area.queue_render()
 
     def on_da_release(
@@ -3436,6 +3477,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         """
         if not self.selected_page or self._preview_region_id is not None:
             self._set_viewer_cursor(None)
+            return
+        if self._drag_rect is not None:
             return
 
         handle: RegionHandle | None = None
