@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, final, override
 
 import gi
+import imagecodecs
 import numpy as np
 import pyvips
 from OpenGL import GL
@@ -407,7 +408,11 @@ class ScannerWindow(Adw.ApplicationWindow):
         img = Image.new_from_memory(arr.tobytes(), width, height, bands, fmt)
 
         if bands in (3, 4):
-            interp = pyvips.Interpretation.SRGB
+            interp = (
+                pyvips.Interpretation.SRGB
+                if arr.dtype.itemsize == 1
+                else pyvips.Interpretation.SCRGB
+            )
         else:
             interp = pyvips.Interpretation.B_W
         img = img.copy(interpretation=interp)
@@ -3108,7 +3113,7 @@ class ScannerWindow(Adw.ApplicationWindow):
                 y1d,
                 x2d,
                 y2d,
-                (0.781, 0.094, 0.125),
+                (0.2, 0.82, 0.478),
                 _REGION_BORDER_WIDTH,
             )
 
@@ -3517,7 +3522,15 @@ class ScannerWindow(Adw.ApplicationWindow):
 
                 fname = f"{timestamp}_G{gidx:02d}_P{pi:02d}_R{ri:02d}.jxl"
                 out_path = out_dir / fname
-                crop.jxlsave(out_path, lossless=True)
+
+                # crop.jxlsave(out_path, lossless=True)
+                # imagecodecs.jpegxl_encode(crop.numpy(), lossless=True)
+                imagecodecs.imwrite(
+                    out_path,
+                    crop.numpy(),
+                    codec="jpegxl",
+                    lossless=True,
+                )
             except Exception as e:
                 last_error = str(e)
             else:
