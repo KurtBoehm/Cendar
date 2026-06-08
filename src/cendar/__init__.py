@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -208,12 +209,17 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.drawing_area: Gtk.GLArea
 
         # GL preview state (texture + key to know when to rebuild)
+        self._gl_use_texel_fetch: bool = False
+        self._gl_is_gles: bool = False
+        self._gl_glsl_version_num: int = 100  # e.g. 100, 300, 330
         self._gl_tex_id: int | None = None
         self._gl_tex_w: int = 0
         self._gl_tex_h: int = 0
+        self._image_w: int = 0
+        self._image_h: int = 0
         self._gl_tex_key: (
-            tuple[str, int, int, str]
-            | tuple[str, int, int, str, str, int, int, int, int, int]
+            tuple[str, int, int, str, int, int]
+            | tuple[str, int, int, str, str, int, int, int, int, int, int, int]
         ) | None = None
         self._gl_preview_active: bool = False
 
@@ -244,6 +250,36 @@ class ScannerWindow(Adw.ApplicationWindow):
         self.refresh_regions_list()
 
         self._start_initial_sane_init()
+
+    def _detect_gl_version(self) -> None:
+        # Called after make_current()
+        ver = GL.glGetString(GL.GL_VERSION)
+        sl = GL.glGetString(GL.GL_SHADING_LANGUAGE_VERSION)
+        if ver is None or sl is None:
+            return
+
+        ver_s = ver.decode("ascii", "ignore")
+        sl_s = sl.decode("ascii", "ignore")
+
+        # Very simple ES detection
+        self._gl_is_gles = "OpenGL ES" in ver_s
+
+        # Parse "x.y" from the GLSL version string
+        m = re.search(r"(\d+)\.(\d+)", sl_s)
+        if m:
+            glsl_major = int(m.group(1))
+            glsl_minor = int(m.group(2))
+            # For ES this is 1.00, 3.00, 3.10 → 100, 300, 310, ...
+            # For desktop this is 1.20, 3.30 → 120, 330, ...
+            self._gl_glsl_version_num = glsl_major * 100 + glsl_minor
+
+        # texelFetch availability:
+        # - GLES: fragment texelFetch is core in GLSL ES 3.00+ (ES 3.0+)
+        # - Desktop: texelFetch is core in GLSL 1.30+ (GL 3.0+)
+        if self._gl_is_gles:
+            self._gl_use_texel_fetch = self._gl_glsl_version_num >= 300
+        else:
+            self._gl_use_texel_fetch = self._gl_glsl_version_num >= 130
 
     # --- Small internal helpers/factories ---
 
@@ -825,6 +861,10 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         self.drawing_area.connect("render", self.on_gl_render)
         self.drawing_area.connect("unrealize", self.on_glarea_unrealize)
+        self.drawing_area.connect(
+            "notify::scale-factor",
+            self.on_da_scale_factor_changed,
+        )
 
         viewer_box.append(self.drawing_area)
 
@@ -2366,83 +2406,156 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._display_offset_y = (ch - disp_h) / 2.0
 
     def _get_glsl_sources(self) -> tuple[str, str]:
-        """Return GLSL source strings for the textured quad and SDF border shaders."""
-        vert = """
-            #version 100
-            precision mediump float;
-            attribute vec2 aPos;
-            attribute vec2 aTexCoord;
-            varying vec2 vTexCoord;
-            void main() {
-                gl_Position = vec4(aPos, 0.0, 1.0);
-                vTexCoord = aTexCoord;
-            }
         """
-        frag = """
-            #version 100
-            #extension GL_OES_standard_derivatives : enable
-            precision mediump float;
-            varying vec2 vTexCoord;
+        Return GLSL source strings for the textured quad + SDF border shader.
 
-            uniform sampler2D uTexture;
-            uniform bool uUseTexture;
-            uniform vec4 uColor;
-
-            // SDF uniforms
-            uniform vec2 uRectMin;        // top-left in canvas px (path rect)
-            uniform vec2 uRectMax;        // bottom-right in canvas px
-            uniform float uBorder;        // stroke width in px
-            uniform vec2 uViewportSize;   // (width, height) in px
-
-            void main() {
-                if (uUseTexture) {
-                    gl_FragColor = texture2D(uTexture, vTexCoord);
-                } else {
-                    // Fragment position in canvas coordinates, origin at top-left
-                    vec2 fragPx = vec2(gl_FragCoord.x,
-                                       uViewportSize.y - gl_FragCoord.y);
-
-                    // Rect center and half-size in px (this is the "path" rect)
-                    vec2 rectCenter = 0.5 * (uRectMin + uRectMax);
-                    vec2 halfSize   = 0.5 * (uRectMax - uRectMin);
-
-                    // Clamp radius to not exceed half the minimum dimension
-                    float r = min(uBorder, min(halfSize.x, halfSize.y));
-
-                    // Signed distance to rounded rectangle from
-                    // https://iquilezles.org/articles/distfunctions2d/
-                    vec2 p = fragPx - rectCenter;
-                    vec2 q = abs(p) - halfSize + r;
-                    float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
-
-                    // Stroke width uBorder, centered on the distance=0 contour:
-                    float halfB = 0.5 * uBorder;
-
-                    // Anti-aliasing width in pixels
-                    float aa = max(fwidth(dist), 1.0);
-
-                    // We want the band |dist| <= halfB to be opaque.
-                    // dist_abs <= halfB - aa  => alpha ~ 1
-                    // dist_abs >= halfB + aa  => alpha ~ 0
-                    float dist_abs = abs(dist);
-                    float a = halfB - aa;
-                    float b = halfB + aa;
-                    float alpha = 1.0 - smoothstep(a, b, dist_abs);
-
-                    if (alpha <= 0.0) {
-                        discard;
-                    }
-
-                    gl_FragColor = uColor * alpha;
-                }
-            }
+        Chooses between:
+        - ES 2.0 / GL 2.x style (#version 100 / 120, texture2D, gl_FragColor)
+        - ES 3.0+ / GL 3.0+ style (#version 300 es / 130, texelFetch, out vec4)
+        based on self._gl_is_gles and self._gl_use_texel_fetch.
         """
-        return vert, frag
+        is_gles = self._gl_is_gles
+        use_tf = self._gl_use_texel_fetch
+
+        # --- Select dialect-specific pieces -------------------------------------
+        if is_gles:
+            precision = "precision mediump float;\n"
+            if use_tf:
+                # GLES 3.0+ (GLSL ES 3.00): texelFetch path
+                v_ver = f_ver = "#version 300 es\n"
+                v_in_pos = "layout(location = 0) in vec2 aPos;"
+                v_in_uv = "layout(location = 1) in vec2 aTexCoord;"
+                v_out_uv = "out vec2 vTexCoord;"
+                f_in_uv = "in vec2 vTexCoord;"
+                f_out_decl = "out vec4 fragColor;"
+                f_out_var = "fragColor"
+                ext_line = ""  # derivatives are core
+            else:
+                # GLES 2.0 (GLSL ES 1.00): no texelFetch
+                v_ver = f_ver = "#version 100\n"
+                v_in_pos = "attribute vec2 aPos;"
+                v_in_uv = "attribute vec2 aTexCoord;"
+                v_out_uv = "varying vec2 vTexCoord;"
+                f_in_uv = "varying vec2 vTexCoord;"
+                f_out_decl = ""
+                f_out_var = "gl_FragColor"
+                ext_line = "#extension GL_OES_standard_derivatives : enable\n"
+        else:
+            # Desktop GL
+            precision = ""
+            ext_line = ""
+            if use_tf:
+                # GL 3.0+ (GLSL 1.30+): texelFetch path
+                v_ver = f_ver = "#version 130\n"
+                v_in_pos = "in vec2 aPos;"
+                v_in_uv = "in vec2 aTexCoord;"
+                v_out_uv = "out vec2 vTexCoord;"
+                f_in_uv = "in vec2 vTexCoord;"
+                f_out_decl = "out vec4 fragColor;"
+                f_out_var = "fragColor"
+            else:
+                # GL 2.1 (GLSL 1.20): no texelFetch
+                v_ver = f_ver = "#version 120\n"
+                v_in_pos = "attribute vec2 aPos;"
+                v_in_uv = "attribute vec2 aTexCoord;"
+                v_out_uv = "varying vec2 vTexCoord;"
+                f_in_uv = "varying vec2 vTexCoord;"
+                f_out_decl = ""
+                f_out_var = "gl_FragColor"
+
+        # Texture sampling expression
+        if use_tf:
+            tex_expr = (
+                "texelFetch(uTexture, "
+                "ivec2(vTexCoord * vec2(textureSize(uTexture, 0))), 0)"
+            )
+        else:
+            tex_expr = "texture2D(uTexture, vTexCoord)"
+
+        # Normalize strings that might be empty
+        f_out_decl_nl = (f_out_decl + "\n") if f_out_decl else ""
+
+        # --- Vertex shader ------------------------------------------------------
+        vert_src = (
+            f"{v_ver}"
+            f"{precision}"
+            f"{v_in_pos}\n"
+            f"{v_in_uv}\n"
+            f"{v_out_uv}\n"
+            "void main() {\n"
+            "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+            "    vTexCoord = aTexCoord;\n"
+            "}\n"
+        )
+
+        # --- Fragment shader (shared SDF logic) --------------------------------
+        frag_src = (
+            f"{f_ver}"
+            f"{ext_line}"
+            f"{precision}"
+            f"{f_in_uv}\n"
+            "uniform sampler2D uTexture;\n"
+            "uniform bool uUseTexture;\n"
+            "uniform vec4 uColor;\n"
+            "\n"
+            "// SDF uniforms\n"
+            "uniform vec2 uRectMin;\n"
+            "uniform vec2 uRectMax;\n"
+            "uniform float uBorder;\n"
+            "uniform vec2 uViewportSize;\n"
+            f"{f_out_decl_nl}"
+            "void main() {\n"
+            "    if (uUseTexture) {\n"
+            f"        {f_out_var} = {tex_expr};\n"
+            "    } else {\n"
+            "        // Fragment position in canvas coordinates, origin at top-left\n"
+            "        vec2 fragPx = vec2(gl_FragCoord.x,\n"
+            "                           uViewportSize.y - gl_FragCoord.y);\n"
+            "\n"
+            '        // Rect center and half-size in px (this is the "path" rect)\n'
+            "        vec2 rectCenter = 0.5 * (uRectMin + uRectMax);\n"
+            "        vec2 halfSize   = 0.5 * (uRectMax - uRectMin);\n"
+            "\n"
+            "        // Clamp radius to not exceed half the minimum dimension\n"
+            "        float r = min(uBorder, min(halfSize.x, halfSize.y));\n"
+            "\n"
+            "        // Signed distance to rounded rectangle from\n"
+            "        // https://iquilezles.org/articles/distfunctions2d/\n"
+            "        vec2 p = fragPx - rectCenter;\n"
+            "        vec2 q = abs(p) - halfSize + r;\n"
+            "        float dist = min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;\n"
+            "\n"
+            "        // Stroke width uBorder, centered on the distance=0 contour:\n"
+            "        float halfB = 0.5 * uBorder;\n"
+            "\n"
+            "        // Anti-aliasing width in pixels\n"
+            "        float aa = max(fwidth(dist), 1.0);\n"
+            "\n"
+            "        // We want the band |dist| <= halfB to be opaque.\n"
+            "        // dist_abs <= halfB - aa  => alpha ~ 1\n"
+            "        // dist_abs >= halfB + aa  => alpha ~ 0\n"
+            "        float dist_abs = abs(dist);\n"
+            "        float a = halfB - aa;\n"
+            "        float b = halfB + aa;\n"
+            "        float alpha = 1.0 - smoothstep(a, b, dist_abs);\n"
+            "\n"
+            "        if (alpha <= 0.0) {\n"
+            "            discard;\n"
+            "        }\n"
+            "\n"
+            f"        {f_out_var} = uColor * alpha;\n"
+            "    }\n"
+            "}\n"
+        )
+
+        return vert_src, frag_src
 
     def _init_gl_resources(self, context: Gdk.GLContext) -> None:
         """Compile shaders and set up GL buffers the first time we get a context."""
         if self._gl_program != 0:
             return
+
+        self._detect_gl_version()
 
         vert_src, frag_src = self._get_glsl_sources()
 
@@ -2492,11 +2605,17 @@ class ScannerWindow(Adw.ApplicationWindow):
         if hasattr(GL, "glGenVertexArrays"):
             self._gl_vao = GL.glGenVertexArrays(1)
 
-    def _ensure_gl_texture(self, canvas_w: int, canvas_h: int) -> bool:
+    def _ensure_gl_texture(
+        self,
+        canvas_w: int,
+        canvas_h: int,
+        scale_factor: int,
+    ) -> bool:
         """
         Ensure we have a GL texture for the current page or region preview.
 
-        Returns False if there is nothing to draw.
+        The texture is downsampled to exactly the size it will occupy in
+        the framebuffer, so that one texel corresponds to one screen pixel.
         """
         if not self.selected_page:
             return False
@@ -2507,11 +2626,39 @@ class ScannerWindow(Adw.ApplicationWindow):
         img_w, img_h = pil_img.size
         preview_active = reg is not None
 
+        # Save logical image size (used for layout, hit-testing, etc.)
+        self._image_w = img_w
+        self._image_h = img_h
+
+        # --- Compute display geometry (same logic as _update_display_geometry) ---
+
+        cw = max(1, canvas_w)
+        ch = max(1, canvas_h)
+
+        if preview_active:
+            cwp, chp = cw, ch
+        else:
+            cwp = max(1, cw - _REGION_BORDER_WIDTH)
+            chp = max(1, ch - _REGION_BORDER_WIDTH)
+
+        scale = min(cwp / img_w, chp / img_h)
+        if scale <= 0.0:
+            scale = 1.0
+
+        disp_w_logical = img_w * scale
+        disp_h_logical = img_h * scale
+
+        # Desired size on screen in framebuffer pixels (one texel == one pixel)
+        fb_disp_w = max(1, int(round(disp_w_logical * scale_factor)))
+        fb_disp_h = max(1, int(round(disp_h_logical * scale_factor)))
+
+        # --- Build texture cache key including target size ---
+
         if reg is None:
             key: (
-                tuple[str, int, int, str]
-                | tuple[str, int, int, str, str, int, int, int, int, int]
-            ) = (page.id, img_w, img_h, "full")
+                tuple[str, int, int, str, int, int]
+                | tuple[str, int, int, str, str, int, int, int, int, int, int, int]
+            ) = (page.id, img_w, img_h, "full", fb_disp_w, fb_disp_h)
         else:
             key = (
                 page.id,
@@ -2524,12 +2671,20 @@ class ScannerWindow(Adw.ApplicationWindow):
                 reg.x2,
                 reg.y2,
                 reg.rotation % 360,
+                fb_disp_w,
+                fb_disp_h,
             )
 
         if key != self._gl_tex_key:
-            if pil_img.mode != "RGBA":
-                pil_img = pil_img.convert("RGBA")
-            data = pil_img.tobytes("raw", "RGBA")
+            # True area downsampling when shrinking
+            pil_for_tex = pil_img.resize(
+                (fb_disp_w, fb_disp_h),
+                resample=PILImage.Resampling.BOX,
+            )
+
+            if pil_for_tex.mode != "RGBA":
+                pil_for_tex = pil_for_tex.convert("RGBA")
+            data = pil_for_tex.tobytes("raw", "RGBA")
 
             if self._gl_tex_id:
                 GL.glDeleteTextures([self._gl_tex_id])
@@ -2539,8 +2694,14 @@ class ScannerWindow(Adw.ApplicationWindow):
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._gl_tex_id)
 
             GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+
+            # 1:1 sampling, no additional filtering from GL
+            GL.glTexParameteri(
+                GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_NEAREST
+            )
+            GL.glTexParameteri(
+                GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_NEAREST
+            )
             GL.glTexParameteri(
                 GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE
             )
@@ -2552,19 +2713,21 @@ class ScannerWindow(Adw.ApplicationWindow):
                 GL.GL_TEXTURE_2D,
                 0,
                 GL.GL_RGBA,
-                img_w,
-                img_h,
+                fb_disp_w,
+                fb_disp_h,
                 0,
                 GL.GL_RGBA,
                 GL.GL_UNSIGNED_BYTE,
                 data,
             )
 
-            self._gl_tex_w = img_w
-            self._gl_tex_h = img_h
+            self._gl_tex_w = fb_disp_w
+            self._gl_tex_h = fb_disp_h
             self._gl_tex_key = key
 
         self._gl_preview_active = preview_active
+
+        # Compute offsets + logical scale for hit-testing and layout
         self._update_display_geometry(canvas_w, canvas_h, img_w, img_h, preview_active)
 
         return self._gl_tex_id is not None
@@ -2584,12 +2747,17 @@ class ScannerWindow(Adw.ApplicationWindow):
                 print(f"Failed to init GL resources: {e}")
                 return False
 
+        scale_factor = max(1, area.get_scale_factor())
+
         width = area.get_allocated_width()
         height = area.get_allocated_height()
         if width <= 0 or height <= 0:
             return True
 
-        GL.glViewport(0, 0, width, height)
+        fb_width = width * scale_factor
+        fb_height = height * scale_factor
+
+        GL.glViewport(0, 0, fb_width, fb_height)
         GL.glDisable(GL.GL_DEPTH_TEST)
         GL.glClearColor(0.0, 0.0, 0.0, 0.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
@@ -2597,7 +2765,8 @@ class ScannerWindow(Adw.ApplicationWindow):
         if not self.selected_page:
             return True
 
-        if not self._ensure_gl_texture(width, height):
+        # Use logical width/height for display geometry.
+        if not self._ensure_gl_texture(width, height, scale_factor):
             return True
 
         GL.glUseProgram(self._gl_program)
@@ -2607,12 +2776,14 @@ class ScannerWindow(Adw.ApplicationWindow):
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, self._gl_vbo)
 
         def canvas_to_ndc(x: float, y: float) -> tuple[float, float]:
+            # x, y in logical canvas units; NDC uses logical width/height
             nx = (2.0 * x / float(width)) - 1.0
             ny = 1.0 - (2.0 * y / float(height))
             return nx, ny
 
-        img_w = self._gl_tex_w
-        img_h = self._gl_tex_h
+        # Use logical image size for geometry
+        img_w = self._image_w
+        img_h = self._image_h
         scale = self._display_scale
 
         disp_w = img_w * scale
@@ -2625,37 +2796,21 @@ class ScannerWindow(Adw.ApplicationWindow):
         x0n, y0n = canvas_to_ndc(x0, y0)
         x1n, y1n = canvas_to_ndc(x1, y1)
 
+        # fmt: off
         vertices_quad = np.array(
             [
                 # first triangle
-                x0n,
-                y0n,
-                0.0,
-                0.0,
-                x1n,
-                y0n,
-                1.0,
-                0.0,
-                x1n,
-                y1n,
-                1.0,
-                1.0,
+                x0n, y0n, 0.0, 0.0,
+                x1n, y0n, 1.0, 0.0,
+                x1n, y1n, 1.0, 1.0,
                 # second triangle
-                x0n,
-                y0n,
-                0.0,
-                0.0,
-                x1n,
-                y1n,
-                1.0,
-                1.0,
-                x0n,
-                y1n,
-                0.0,
-                1.0,
+                x0n, y0n, 0.0, 0.0,
+                x1n, y1n, 1.0, 1.0,
+                x0n, y1n, 0.0, 1.0,
             ],
             dtype=np.float32,
         )
+        # fmt: on
 
         GL.glBufferData(
             GL.GL_ARRAY_BUFFER,
@@ -2699,14 +2854,18 @@ class ScannerWindow(Adw.ApplicationWindow):
                 GL.glBindVertexArray(0)
             return True
 
+        # --- Region overlays (SDF borders) ---
+
         GL.glEnable(GL.GL_BLEND)
         GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)
 
-        GL.glUniform2f(self._gl_uniform_viewport_size, float(width), float(height))
+        # Viewport size in framebuffer pixels (for gl_FragCoord)
+        GL.glUniform2f(
+            self._gl_uniform_viewport_size,
+            float(fb_width),
+            float(fb_height),
+        )
         GL.glUniform1i(self._gl_uniform_use_tex, 0)
-
-        scale_factor = max(1, area.get_scale_factor())
-        border_px = float(_REGION_BORDER_WIDTH * scale_factor)
 
         def img_to_canvas(px: int, py: int) -> tuple[float, float]:
             return (
@@ -2735,46 +2894,34 @@ class ScannerWindow(Adw.ApplicationWindow):
             if w <= 0.0 or h <= 0.0:
                 return
 
-            GL.glUniform2f(self._gl_uniform_rect_min, x1c, y1c)
-            GL.glUniform2f(self._gl_uniform_rect_max, x2c, y2c)
-            GL.glUniform1f(self._gl_uniform_border, border_px)
+            # Convert logical canvas coordinates to framebuffer pixels for the SDF
+            x1_px, y1_px = x1c * scale_factor, y1c * scale_factor
+            x2_px, y2_px = x2c * scale_factor, y2c * scale_factor
+
+            GL.glUniform2f(self._gl_uniform_rect_min, x1_px, y1_px)
+            GL.glUniform2f(self._gl_uniform_rect_max, x2_px, y2_px)
+            GL.glUniform1f(self._gl_uniform_border, border_px * scale_factor)
             GL.glUniform4f(self._gl_uniform_color, color[0], color[1], color[2], 1.0)
 
+            # Expand quad in logical units
             bx1, by1 = x1c - border_px, y1c - border_px
             bx2, by2 = x2c + border_px, y2c + border_px
 
             bx1n, by1n = canvas_to_ndc(bx1, by1)
             bx2n, by2n = canvas_to_ndc(bx2, by2)
-
+            # fmt: off
             vertices = np.array(
                 [
-                    bx1n,
-                    by1n,
-                    0.0,
-                    0.0,
-                    bx2n,
-                    by1n,
-                    0.0,
-                    0.0,
-                    bx2n,
-                    by2n,
-                    0.0,
-                    0.0,
-                    bx1n,
-                    by1n,
-                    0.0,
-                    0.0,
-                    bx2n,
-                    by2n,
-                    0.0,
-                    0.0,
-                    bx1n,
-                    by2n,
-                    0.0,
-                    0.0,
+                    bx1n, by1n, 0.0, 0.0,
+                    bx2n, by1n, 0.0, 0.0,
+                    bx2n, by2n, 0.0, 0.0,
+                    bx1n, by1n, 0.0, 0.0,
+                    bx2n, by2n, 0.0, 0.0,
+                    bx1n, by2n, 0.0, 0.0,
                 ],
                 dtype=np.float32,
             )
+            # fmt: on
 
             GL.glBufferData(
                 GL.GL_ARRAY_BUFFER,
@@ -2807,19 +2954,29 @@ class ScannerWindow(Adw.ApplicationWindow):
             col = (
                 (0.2, 0.82, 0.478)
                 if r.id == self._resize_region_id
-                else (0.781, 0.094, 0.125)
+                else (0.878, 0.106, 0.141)
                 if r.id in self.expanded_region_ids
-                else (0.128, 0.32, 0.552)
+                else (0.208, 0.518, 0.894)
             )
-            draw_sdf_rounded_rect_canvas(x1c, y1c, x2c, y2c, col, border_px)
+            draw_sdf_rounded_rect_canvas(x1c, y1c, x2c, y2c, col, _REGION_BORDER_WIDTH)
 
         if self._drag_rect is not None:
             x1d, y1d, x2d, y2d = self._drag_rect
             draw_sdf_rounded_rect_canvas(
-                x1d, y1d, x2d, y2d, (0.781, 0.094, 0.125), border_px
+                x1d, y1d, x2d, y2d, (0.781, 0.094, 0.125), _REGION_BORDER_WIDTH
             )
 
         return False
+
+    def on_da_scale_factor_changed(
+        self, area: Gtk.GLArea, _pspec: GObject.ParamSpec
+    ) -> None:
+        """
+        Called when the widget scale factor changes (e.g. moving between monitors with
+        different DPI). Force a redraw so we recompute the viewport and SDF uniforms
+        with the new scale.
+        """
+        area.queue_render()
 
     def on_glarea_unrealize(self, area: Gtk.GLArea) -> None:
         """GLArea unrealize callback: free GL resources."""

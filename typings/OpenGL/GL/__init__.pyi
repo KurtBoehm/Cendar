@@ -16,6 +16,8 @@ GL_TEXTURE_WRAP_S: int
 GL_TEXTURE_WRAP_T: int
 GL_CLAMP_TO_EDGE: int
 GL_LINEAR: int
+GL_NEAREST: int
+GL_LINEAR_MIPMAP_LINEAR: int
 
 GL_RGBA: int
 GL_UNSIGNED_BYTE: int
@@ -36,6 +38,10 @@ GL_TEXTURE0: int
 GL_BLEND: int
 GL_ONE: int
 GL_ONE_MINUS_SRC_ALPHA: int
+
+# For version / GLSL queries
+GL_VERSION: int
+GL_SHADING_LANGUAGE_VERSION: int
 
 # --- Shader / program functions ---
 
@@ -94,6 +100,10 @@ def glTexImage2D(
     pixels: Any,
 ) -> None: ...
 def glActiveTexture(texture: int) -> None: ...
+
+# --- Queries / misc ---
+
+def glGetString(name: int) -> bytes | None: ...
 
 # --- Uniforms / drawing / state ---
 
