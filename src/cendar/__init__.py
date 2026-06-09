@@ -42,6 +42,9 @@ RegionHandle = Literal[
     "bottom_left",
     "bottom_right",
 ]
+TexKeyFull = tuple[str, int, int, str, int, int]
+TexKeyRegion = tuple[str, int, int, str, str, int, int, int, int, int, int, int]
+TexKey = TexKeyFull | TexKeyRegion
 
 _ROTATION_LABEL_TO_CCW: dict[str, int] = {
     "0°": 0,
@@ -117,6 +120,16 @@ class PageGroup:
     id: str
     name: str
     pages: list[Page] = field(default_factory=list)
+
+
+@dataclass
+class _ResizeRequest:
+    """Internal request for asynchronous texture scaling."""
+
+    generation: int
+    key: TexKey
+    img: Image
+    display_scale_total: float
 
 
 ########################################################################################
@@ -227,6 +240,20 @@ class ScannerWindow(Adw.ApplicationWindow):
             | tuple[str, int, int, str, str, int, int, int, int, int, int, int]
         ) | None = None
         self._gl_preview_active: bool = False
+
+        # Async texture scaling worker.
+        self._resize_lock = threading.Lock()
+        self._resize_cond = threading.Condition(self._resize_lock)
+        self._resize_thread: threading.Thread | None = None
+        self._resize_pending: _ResizeRequest | None = None
+        self._resize_generation: int = 0
+        self._gl_pending_tex_key: TexKey | None = None
+
+        # Debounce for interactive GLArea resizing.
+        self._resize_throttle_source_id: int = 0
+        self._resize_throttle_key: TexKey | None = None
+        self._resize_throttle_img: Image | None = None
+        self._resize_throttle_scale: float = 1.0
 
         # GL shader pipeline.
         self._gl_program: int = 0
@@ -2601,6 +2628,286 @@ class ScannerWindow(Adw.ApplicationWindow):
         self._display_offset_x = (cw - disp_w) / 2.0
         self._display_offset_y = (ch - disp_h) / 2.0
 
+    @staticmethod
+    def _split_tex_key(key: TexKey) -> tuple[tuple[object, ...], tuple[int, int]]:
+        """Split a texture key into (source part, (fb_width, fb_height))."""
+        return key[:-2], (key[-2], key[-1])
+
+    @staticmethod
+    def _make_tex_key(
+        page: Page,
+        img_w: int,
+        img_h: int,
+        reg: Region | None,
+        fb_disp_w: int,
+        fb_disp_h: int,
+    ) -> TexKey:
+        """Build a texture cache key from page/region and framebuffer size."""
+        if reg is None:
+            return (page.id, img_w, img_h, "full", fb_disp_w, fb_disp_h)
+        return (
+            page.id,
+            img_w,
+            img_h,
+            "reg",
+            reg.id,
+            reg.x1,
+            reg.y1,
+            reg.x2,
+            reg.y2,
+            reg.rotation % 360,
+            fb_disp_w,
+            fb_disp_h,
+        )
+
+    @staticmethod
+    def _build_vips_texture_image(
+        img: Image,
+        display_scale_total: float,
+    ) -> Image:
+        """Resample and convert a pyvips image to 8-bit RGBA ready for OpenGL."""
+        if display_scale_total <= 0.0:
+            display_scale_total = 1.0
+
+        tex_img = img.resize(display_scale_total, kernel=pyvips.Kernel.LANCZOS3)
+
+        if tex_img.format != "uchar":
+            tex_img = tex_img.cast("uchar", shift=True)
+
+        if tex_img.interpretation != pyvips.Interpretation.SRGB:
+            tex_img = tex_img.colourspace(pyvips.Interpretation.SRGB)
+
+        if tex_img.bands == 3:
+            tex_img = tex_img.addalpha()
+        elif tex_img.bands > 4:
+            tex_img = tex_img.extract_band(0, n=4)
+
+        return tex_img
+
+    def _create_or_update_gl_texture(
+        self,
+        data: np.ndarray,
+        tex_w: int,
+        tex_h: int,
+    ) -> None:
+        """Create or replace the GL texture from an RGBA NumPy array."""
+        if self._gl_tex_id:
+            GL.glDeleteTextures([self._gl_tex_id])
+            self._gl_tex_id = None
+
+        self._gl_tex_id = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._gl_tex_id)
+
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D,
+            GL.GL_TEXTURE_MIN_FILTER,
+            GL.GL_LINEAR,
+        )
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D,
+            GL.GL_TEXTURE_MAG_FILTER,
+            GL.GL_LINEAR,
+        )
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D,
+            GL.GL_TEXTURE_WRAP_S,
+            GL.GL_CLAMP_TO_EDGE,
+        )
+        GL.glTexParameteri(
+            GL.GL_TEXTURE_2D,
+            GL.GL_TEXTURE_WRAP_T,
+            GL.GL_CLAMP_TO_EDGE,
+        )
+
+        GL.glTexImage2D(
+            GL.GL_TEXTURE_2D,
+            0,
+            GL.GL_RGBA,
+            tex_w,
+            tex_h,
+            0,
+            GL.GL_RGBA,
+            GL.GL_UNSIGNED_BYTE,
+            data,
+        )
+
+        self._gl_tex_w = tex_w
+        self._gl_tex_h = tex_h
+
+    def _rebuild_texture_sync(
+        self,
+        img: Image,
+        key: TexKey,
+        img_w: int,
+        img_h: int,
+        preview_active: bool,
+        display_scale_total: float,
+    ) -> None:
+        """
+        Schedule a texture rebuild for a new source image/region.
+
+        Heavy work (resample + NumPy conversion) happens on the worker thread.
+        """
+        # Source changed, so any pending resize-only debounce is obsolete.
+        self._cancel_resize_throttle()
+
+        # Invalidate any in‑flight resize and drop the old texture so we do not
+        # briefly show the wrong page/region while a new one is loading.
+        self._invalidate_async_resize_state()
+        if self._gl_tex_id:
+            GL.glDeleteTextures([self._gl_tex_id])
+            self._gl_tex_id = None
+        self._gl_tex_key = None
+        self._gl_pending_tex_key = None
+
+        # Queue the actual resize + NumPy conversion on the worker.
+        self._queue_resize_request(key, img, display_scale_total)
+
+    def _invalidate_async_resize_state(self) -> None:
+        """Invalidate in-flight async resize results."""
+        with self._resize_lock:
+            self._resize_generation += 1
+            self._resize_pending = None
+        self._gl_pending_tex_key = None
+        self._cancel_resize_throttle()
+
+    def _queue_resize_request(
+        self,
+        key: TexKey,
+        img: Image,
+        display_scale_total: float,
+    ) -> None:
+        """Schedule an asynchronous texture resize for the current source image."""
+        with self._resize_lock:
+            self._resize_generation += 1
+            gen = self._resize_generation
+            self._resize_pending = _ResizeRequest(
+                generation=gen,
+                key=key,
+                img=img,
+                display_scale_total=display_scale_total,
+            )
+            if self._resize_thread is None or not self._resize_thread.is_alive():
+                self._resize_thread = threading.Thread(
+                    target=self._resize_worker,
+                    daemon=True,
+                )
+                self._resize_thread.start()
+            self._resize_cond.notify_all()
+
+        self._gl_pending_tex_key = key
+
+    def _cancel_resize_throttle(self) -> None:
+        """Cancel any outstanding debounce timer for texture resizes."""
+        if self._resize_throttle_source_id != 0:
+            GLib.source_remove(self._resize_throttle_source_id)
+            self._resize_throttle_source_id = 0
+        self._resize_throttle_key = None
+        self._resize_throttle_img = None
+
+    def _queue_resize_request_debounced(
+        self,
+        key: TexKey,
+        img: Image,
+        display_scale_total: float,
+    ) -> None:
+        """
+        Debounce texture resizes while the GLArea is being resized.
+
+        Geometry and preview scaling are updated on every frame, but the expensive
+        downscaled texture is only recomputed after a short pause in resize events.
+        """
+        # Always keep only the latest desired request.
+        self._resize_throttle_key = key
+        self._resize_throttle_img = img
+        self._resize_throttle_scale = display_scale_total
+
+        if self._resize_throttle_source_id != 0:
+            # A timer is already pending; it will pick up the latest values.
+            return
+
+        def fire() -> bool:
+            key2 = self._resize_throttle_key
+            img2 = self._resize_throttle_img
+            scale2 = self._resize_throttle_scale
+
+            # Clear throttle state first so we do not accidentally reschedule.
+            self._resize_throttle_source_id = 0
+            self._resize_throttle_key = None
+            self._resize_throttle_img = None
+
+            if key2 is None or img2 is None:
+                return False
+
+            # Schedule the actual worker job with the final size.
+            self._queue_resize_request(key2, img2, scale2)
+            return False
+
+        self._resize_throttle_source_id = GLib.timeout_add(100, fire)
+
+    def _resize_worker(self) -> None:
+        """Background worker that performs the expensive pyvips resize."""
+        while True:
+            with self._resize_lock:
+                while self._resize_pending is None:
+                    self._resize_cond.wait()
+                req = self._resize_pending
+                self._resize_pending = None
+
+            assert req is not None
+
+            try:
+                tex_img = self._build_vips_texture_image(
+                    req.img,
+                    req.display_scale_total,
+                )
+                data = tex_img.numpy()
+                tex_w = tex_img.width
+                tex_h = tex_img.height
+            except Exception as e:
+                print(f"Async resize failed: {e!r}")
+                continue
+
+            GLib.idle_add(
+                self._apply_async_resize_result,
+                req.generation,
+                req.key,
+                data,
+                tex_w,
+                tex_h,
+            )
+
+    def _apply_async_resize_result(
+        self,
+        generation: int,
+        key: TexKey,
+        data: np.ndarray,
+        tex_w: int,
+        tex_h: int,
+    ) -> bool:
+        """
+        Apply an asynchronously computed texture if it is still up to date.
+
+        Returns False to remove this idle handler.
+        """
+        if generation != self._resize_generation:
+            return False
+
+        if not self.drawing_area.get_realized():
+            return False
+
+        self.drawing_area.make_current()
+        if self.drawing_area.get_error() is not None:
+            return False
+
+        self._create_or_update_gl_texture(data, tex_w, tex_h)
+        self._gl_tex_key = key
+        self._gl_pending_tex_key = None
+        self.drawing_area.queue_render()
+        return False
+
     def _get_glsl_sources(self) -> tuple[str, str]:
         """
         Return GLSL source strings for the textured quad + SDF border shader.
@@ -2759,8 +3066,9 @@ class ScannerWindow(Adw.ApplicationWindow):
         """
         Ensure we have a GL texture for the current page or region preview.
 
-        The texture is downsampled with pyvips when shrinking, then uploaded
-        as an 8-bit RGBA texture.
+        When only the GLArea size changes, reuse the previous texture while a worker
+        thread computes a new one. When the source image/region changes, old textures
+        are dropped and a worker job is queued.
         """
         if not self.selected_page:
             return False
@@ -2769,14 +3077,18 @@ class ScannerWindow(Adw.ApplicationWindow):
 
         img, reg = self._get_display_image()
         img_w, img_h = img.width, img.height
+        if img_w <= 0 or img_h <= 0:
+            return False
+
         preview_active = reg is not None
 
+        # Track logical image size and preview state for this frame.
         self._image_w = img_w
         self._image_h = img_h
+        self._gl_preview_active = preview_active
 
         cw = max(1, canvas_w)
         ch = max(1, canvas_h)
-
         if preview_active:
             cwp, chp = cw, ch
         else:
@@ -2793,101 +3105,55 @@ class ScannerWindow(Adw.ApplicationWindow):
         fb_disp_w = max(1, int(round(disp_w_logical * scale_factor)))
         fb_disp_h = max(1, int(round(disp_h_logical * scale_factor)))
 
-        if reg is None:
-            key: (
-                tuple[str, int, int, str, int, int]
-                | tuple[str, int, int, str, str, int, int, int, int, int, int, int]
-            ) = (page.id, img_w, img_h, "full", fb_disp_w, fb_disp_h)
-        else:
-            key = (
-                page.id,
-                img_w,
-                img_h,
-                "reg",
-                reg.id,
-                reg.x1,
-                reg.y1,
-                reg.x2,
-                reg.y2,
-                reg.rotation % 360,
-                fb_disp_w,
-                fb_disp_h,
-            )
+        desired_key = self._make_tex_key(page, img_w, img_h, reg, fb_disp_w, fb_disp_h)
+        desired_src_key, _ = self._split_tex_key(desired_key)
 
-        if key != self._gl_tex_key:
-            # Always resample so that one texel = one framebuffer pixel.
-            display_scale_total = scale * scale_factor
-            if display_scale_total <= 0:
-                display_scale_total = 1.0
-
-            tex_img = img.resize(display_scale_total, kernel=pyvips.Kernel.LANCZOS3)
-
-            if tex_img.format != "uchar":
-                tex_img = tex_img.cast("uchar", shift=True)
-
-            # Convert to sRGB if needed, then add alpha.
-            if tex_img.interpretation != pyvips.Interpretation.SRGB:
-                tex_img = tex_img.colourspace(pyvips.Interpretation.SRGB)
-
-            if tex_img.bands == 3:
-                tex_img = tex_img.addalpha()
-            elif tex_img.bands > 4:
-                tex_img = tex_img.extract_band(0, n=4)
-
-            data = tex_img.numpy()
-            tex_w = tex_img.width
-            tex_h = tex_img.height
-
-            if self._gl_tex_id:
-                GL.glDeleteTextures([self._gl_tex_id])
-                self._gl_tex_id = None
-
-            self._gl_tex_id = GL.glGenTextures(1)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._gl_tex_id)
-
-            GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-
-            GL.glTexParameteri(
-                GL.GL_TEXTURE_2D,
-                GL.GL_TEXTURE_MIN_FILTER,
-                GL.GL_NEAREST,
-            )
-            GL.glTexParameteri(
-                GL.GL_TEXTURE_2D,
-                GL.GL_TEXTURE_MAG_FILTER,
-                GL.GL_NEAREST,
-            )
-            GL.glTexParameteri(
-                GL.GL_TEXTURE_2D,
-                GL.GL_TEXTURE_WRAP_S,
-                GL.GL_CLAMP_TO_EDGE,
-            )
-            GL.glTexParameteri(
-                GL.GL_TEXTURE_2D,
-                GL.GL_TEXTURE_WRAP_T,
-                GL.GL_CLAMP_TO_EDGE,
-            )
-
-            GL.glTexImage2D(
-                GL.GL_TEXTURE_2D,
-                0,
-                GL.GL_RGBA,
-                tex_w,
-                tex_h,
-                0,
-                GL.GL_RGBA,
-                GL.GL_UNSIGNED_BYTE,
-                data,
-            )
-
-            self._gl_tex_w = tex_w
-            self._gl_tex_h = tex_h
-            self._gl_tex_key = key
-
-        self._gl_preview_active = preview_active
-
+        # Always update geometry immediately so the image tracks the new canvas size.
         self._update_display_geometry(canvas_w, canvas_h, img_w, img_h, preview_active)
 
+        display_scale_total = self._display_scale * scale_factor
+        if display_scale_total <= 0.0:
+            display_scale_total = 1.0
+
+        current_key = self._gl_tex_key
+        if current_key is None:
+            # First texture for this view: schedule async build and show a cleared
+            # background until it arrives.
+            self._rebuild_texture_sync(
+                img,
+                desired_key,
+                img_w,
+                img_h,
+                preview_active,
+                display_scale_total,
+            )
+            return self._gl_tex_id is not None
+
+        current_src_key, _ = self._split_tex_key(current_key)
+
+        if current_src_key != desired_src_key:
+            # Source image/region changed (new page, rotation, preview toggled, etc.).
+            # Drop old texture and queue a new async build.
+            self._rebuild_texture_sync(
+                img,
+                desired_key,
+                img_w,
+                img_h,
+                preview_active,
+                display_scale_total,
+            )
+            return self._gl_tex_id is not None
+
+        # Same source; only the requested framebuffer size changed.
+        if desired_key == current_key or desired_key == self._gl_pending_tex_key:
+            # We already have the right texture or one is being computed.
+            return self._gl_tex_id is not None
+
+        # Schedule an async resize for the latest size, but debounce it so we do not
+        # recompute the texture on every intermediate size while the user resizes. The
+        # existing texture is kept and simply scaled by the GPU, so the preview scaling
+        # updates on every resize.
+        self._queue_resize_request_debounced(desired_key, img, display_scale_total)
         return self._gl_tex_id is not None
 
     def on_gl_render(self, area: Gtk.GLArea, context: Gdk.GLContext) -> bool:
@@ -3135,14 +3401,22 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     def on_glarea_unrealize(self, area: Gtk.GLArea) -> None:
         """GLArea unrealize callback: free GL resources."""
+        self._invalidate_async_resize_state()
+        self._cancel_resize_throttle()
+
         area.make_current()
         if area.get_error() is not None:
+            self._gl_tex_id = None
+            self._gl_tex_key = None
+            self._gl_pending_tex_key = None
             return
 
         if self._gl_tex_id:
             GL.glDeleteTextures([self._gl_tex_id])
             self._gl_tex_id = None
-            self._gl_tex_key = None
+
+        self._gl_tex_key = None
+        self._gl_pending_tex_key = None
 
         if self._gl_vbo:
             GL.glDeleteBuffers(1, [self._gl_vbo])
@@ -3597,6 +3871,7 @@ class ScannerWindow(Adw.ApplicationWindow):
 
     def close_app(self) -> None:
         """Close the scanner device, shut down SANE, and destroy the window."""
+        self._invalidate_async_resize_state()
         if self.scanner_dev is not None:
             try:
                 self.scanner_dev.close()

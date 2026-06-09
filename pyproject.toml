@@ -8,7 +8,14 @@ authors = [{ name = "Kurt Böhm", email = "kurbo96@gmail.com" }]
 description = "Scan documents, draw crop regions, export as JXL images."
 requires-python = ">=3.12"
 dynamic = ["version"]
-dependencies = ["numpy", "PyGObject", "PyOpenGL", "python-sane", "pyvips"]
+dependencies = [
+  "imagecodecs",
+  "numpy",
+  "PyGObject",
+  "PyOpenGL",
+  "python-sane",
+  "pyvips",
+]
 
 [project.optional-dependencies]
 dev = ["PyGObject-stubs"]
